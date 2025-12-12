@@ -1,0 +1,62 @@
+{
+    "coin": {
+        "name": "Junocash",
+        "shortcut": "JUNO",
+        "label": "Junocash",
+        "alias": "junocash"
+    },
+    "ports": {
+        "backend_rpc": 8232,
+        "backend_message_queue": 38363,
+        "blockbook_internal": 9063,
+        "blockbook_public": 9163
+    },
+    "ipc": {
+        "rpc_url_template": "http://127.0.0.1:{{.Ports.BackendRPC}}",
+        "rpc_user": "rpc",
+        "rpc_pass": "rpc",
+        "rpc_timeout": 25,
+        "message_queue_binding_template": "tcp://127.0.0.1:{{.Ports.BackendMessageQueue}}"
+    },
+    "backend": {
+        "package_name": "backend-junocash",
+        "package_revision": "satoshilabs-1",
+        "system_user": "junocash",
+        "version": "0.9.7",
+        "binary_url": "https://github.com/juno-cash/junocash/releases/download/v0.9.7/junocash-0.9.7-linux64.tar.gz",
+        "verification_type": "sha256",
+        "verification_source": "46b9ba43a2d6b2829286db3cc2aefe412e483b3b6973e501a33a37be846b3c89",
+        "extract_command": "tar -C backend --strip 1 -xf",
+        "exclude_files": [],
+        "exec_command_template": "{{.Env.BackendInstallPath}}/{{.Coin.Alias}}/bin/junocashd -datadir={{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend -conf={{.Env.BackendInstallPath}}/{{.Coin.Alias}}/{{.Coin.Alias}}.conf -pid=/run/{{.Coin.Alias}}/{{.Coin.Alias}}.pid",
+        "logrotate_files_template": "{{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend/*.log",
+        "postinst_script_template": "",
+        "service_type": "simple",
+        "service_additional_params_template": "",
+        "protect_memory": true,
+        "mainnet": true,
+        "server_config_file": "junocash.conf",
+        "client_config_file": "bitcoin_like_client.conf"
+    },
+    "blockbook": {
+        "package_name": "blockbook-junocash",
+        "system_user": "blockbook-junocash",
+        "internal_binding_template": ":{{.Ports.BlockbookInternal}}",
+        "public_binding_template": ":{{.Ports.BlockbookPublic}}",
+        "explorer_url": "",
+        "additional_params": "-resyncindexperiod=50000 -resyncmempoolperiod=3000",
+        "block_chain": {
+            "parse": true,
+            "mempool_workers": 4,
+            "mempool_sub_workers": 8,
+            "block_addresses_to_keep": 300,
+            "xpub_magic": 76067358,
+            "slip44": 8133,
+            "additional_params": {}
+        }
+    },
+    "meta": {
+        "package_maintainer": "IT Admin",
+        "package_maintainer_email": "it@satoshilabs.com"
+    }
+}
