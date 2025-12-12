@@ -23,10 +23,12 @@ func init() {
 	}
 	if tosLinkB, err := embedded.ReadFile("embed/tos_link"); err == nil {
 		tosLink := strings.TrimSpace(string(tosLinkB))
-		if _, err := url.ParseRequestURI(tosLink); err == nil {
-			Text.TOSLink = tosLink
-		} else {
-			panic(fmt.Sprint("tos_link is not valid URL:", err.Error()))
+		if tosLink != "" {
+			if _, err := url.ParseRequestURI(tosLink); err == nil {
+				Text.TOSLink = tosLink
+			} else {
+				panic(fmt.Sprint("tos_link is not valid URL:", err.Error()))
+			}
 		}
 	} else {
 		panic(err)
