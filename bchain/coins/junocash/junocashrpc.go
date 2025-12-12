@@ -16,8 +16,8 @@ import (
 
 // extractVersion extracts the version string (e.g., "v0.9.7-eaaeb5a853c") from the full daemon output
 func extractVersion(fullVersion string) string {
-	// Match 'v' followed by any non-whitespace characters (version string)
-	re := regexp.MustCompile(`v\S+`)
+	// Match version pattern: 'v' followed by digits, dots, and optional suffix (e.g., v0.9.7-eaaeb5a853c)
+	re := regexp.MustCompile(`v\d+\.\d+\.\d+(-[a-zA-Z0-9]+)?`)
 	match := re.FindString(fullVersion)
 	if match != "" {
 		return match
