@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"reflect"
+	"regexp"
 
 	"github.com/golang/glog"
 	"github.com/juju/errors"
@@ -12,6 +13,17 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/btc"
 	"github.com/trezor/blockbook/common"
 )
+
+// extractVersion extracts the version string (e.g., "v0.9.7-eaaeb5a853c") from the full daemon output
+func extractVersion(fullVersion string) string {
+	// Match 'v' followed by any non-whitespace characters (version string)
+	re := regexp.MustCompile(`v\S+`)
+	match := re.FindString(fullVersion)
+	if match != "" {
+		return match
+	}
+	return fullVersion // fallback to original if no match
+}
 
 // JunoCashRPC is an interface to JSON-RPC junocashd service
 type JunoCashRPC struct {
@@ -106,7 +118,7 @@ func (j *JunoCashRPC) GetChainInfo() (*bchain.ChainInfo, error) {
 		Difficulty:      string(chainInfo.Result.Difficulty),
 		Headers:         chainInfo.Result.Headers,
 		SizeOnDisk:      chainInfo.Result.SizeOnDisk,
-		Version:         junocashd,
+		Version:         extractVersion(junocashd),
 		Subversion:      string(networkInfo.Result.Subversion),
 		ProtocolVersion: string(networkInfo.Result.ProtocolVersion),
 		Timeoffset:      networkInfo.Result.Timeoffset,
