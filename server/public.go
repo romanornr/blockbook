@@ -63,6 +63,10 @@ type PublicServer struct {
 	isFullInterface     bool
 }
 
+type totalCoinsResponse struct {
+	TotalCoins string `json:"totalCoins"`
+}
+
 // NewPublicServer creates new public server http interface to blockbook and returns its handle
 // only basic functionality is mapped, to map all functions, call
 func NewPublicServer(binding string, certFiles string, db *db.RocksDB, chain bchain.BlockChain, mempool bchain.Mempool, txCache *db.TxCache, explorerURL string, metrics *common.Metrics, is *common.InternalState, fiatRates *fiat.FiatRates, debugMode bool) (*PublicServer, error) {
@@ -197,6 +201,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/sendtx/", s.jsonHandler(s.apiSendTx, apiDefault))
 	serveMux.HandleFunc(path+"api/estimatefee/", s.jsonHandler(s.apiEstimateFee, apiDefault))
 	serveMux.HandleFunc(path+"api/balancehistory/", s.jsonHandler(s.apiBalanceHistory, apiDefault))
+	serveMux.HandleFunc(path+"api/gettotalcoins", s.jsonHandler(s.apiGetTotalCoins, apiDefault))
 	// v2 format
 	serveMux.HandleFunc(path+"api/v2/block-index/", s.jsonHandler(s.apiBlockIndex, apiV2))
 	serveMux.HandleFunc(path+"api/v2/block-filters/", s.jsonHandler(s.apiBlockFilters, apiV2))
@@ -211,6 +216,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/v2/estimatefee/", s.jsonHandler(s.apiEstimateFee, apiV2))
 	serveMux.HandleFunc(path+"api/v2/feestats/", s.jsonHandler(s.apiFeeStats, apiV2))
 	serveMux.HandleFunc(path+"api/v2/balancehistory/", s.jsonHandler(s.apiBalanceHistory, apiDefault))
+	serveMux.HandleFunc(path+"api/v2/gettotalcoins", s.jsonHandler(s.apiGetTotalCoins, apiV2))
 	serveMux.HandleFunc(path+"api/v2/tickers/", s.jsonHandler(s.apiTickers, apiV2))
 	serveMux.HandleFunc(path+"api/v2/multi-tickers/", s.jsonHandler(s.apiMultiTickers, apiV2))
 	serveMux.HandleFunc(path+"api/v2/tickers-list/", s.jsonHandler(s.apiAvailableVsCurrencies, apiV2))
@@ -1180,6 +1186,31 @@ func (s *PublicServer) apiBlockIndex(r *http.Request, apiVersion int) (interface
 	}
 	return resBlockIndex{
 		BlockHash: hash,
+	}, nil
+}
+
+func (s *PublicServer) isJunoCashChain() bool {
+	switch strings.ToLower(s.chain.GetCoinName()) {
+	case "junocash", "junocash testnet":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *PublicServer) apiGetTotalCoins(r *http.Request, apiVersion int) (interface{}, error) {
+	if !s.isJunoCashChain() {
+		return nil, api.NewAPIError("Endpoint 'gettotalcoins' is only supported for Junocash", true)
+	}
+	si, err := s.api.GetSystemInfo(false)
+	if err != nil {
+		return nil, err
+	}
+	if si == nil || si.Backend == nil || si.Backend.TotalCoins == "" {
+		return nil, api.NewAPIError("Total coins are unavailable from the Junocash backend", true)
+	}
+	return totalCoinsResponse{
+		TotalCoins: si.Backend.TotalCoins,
 	}, nil
 }
 

@@ -27,9 +27,12 @@ type ResGetBlockChainInfo struct {
 		Headers       int               `json:"headers"`
 		Bestblockhash string            `json:"bestblockhash"`
 		Difficulty    common.JSONNumber `json:"difficulty"`
-		Pruned        bool              `json:"pruned"`
-		SizeOnDisk    int64             `json:"size_on_disk"`
-		Consensus     struct {
+		ChainSupply   struct {
+			ChainValue common.JSONNumber `json:"chainValue"`
+		} `json:"chainSupply"`
+		Pruned     bool  `json:"pruned"`
+		SizeOnDisk int64 `json:"size_on_disk"`
+		Consensus  struct {
 			Chaintip  string `json:"chaintip"`
 			Nextblock string `json:"nextblock"`
 		} `json:"consensus"`
@@ -105,6 +108,7 @@ func (j *JunoCashRPC) GetChainInfo() (*bchain.ChainInfo, error) {
 		Chain:           chainInfo.Result.Chain,
 		Difficulty:      string(chainInfo.Result.Difficulty),
 		Headers:         chainInfo.Result.Headers,
+		TotalCoins:      chainInfo.Result.ChainSupply.ChainValue.String(),
 		SizeOnDisk:      chainInfo.Result.SizeOnDisk,
 		Version:         junocashd,
 		Subversion:      string(networkInfo.Result.Subversion),

@@ -95,7 +95,6 @@ func setupRocksDB(parser bchain.BlockChainParser, chain bchain.BlockChain, t *te
 var metrics *common.Metrics
 
 func setupPublicHTTPServer(parser bchain.BlockChainParser, chain bchain.BlockChain, t *testing.T, extendedIndex bool) (*PublicServer, string) {
-	// config with mocked CoinGecko API
 	config := common.Config{
 		CoinName:        "Fakecoin",
 		CoinLabel:       "Fake Coin",
@@ -103,7 +102,10 @@ func setupPublicHTTPServer(parser bchain.BlockChainParser, chain bchain.BlockCha
 		FiatRates:       "coingecko",
 		FiatRatesParams: `{"url": "none", "coin": "ethereum","platformIdentifier": "ethereum","platformVsCurrency": "usd","periodSeconds": 60}`,
 	}
+	return setupPublicHTTPServerWithConfig(parser, chain, t, extendedIndex, config)
+}
 
+func setupPublicHTTPServerWithConfig(parser bchain.BlockChainParser, chain bchain.BlockChain, t *testing.T, extendedIndex bool, config common.Config) (*PublicServer, string) {
 	// add block golomb filters with extended index
 	if extendedIndex {
 		config.BlockGolombFilterP = 20
@@ -1578,6 +1580,41 @@ func setupChain(t *testing.T) (bchain.BlockChainParser, bchain.BlockChain) {
 	return parser, chain
 }
 
+func setupJunoChain(t *testing.T, coinName string, coinShortcut string, totalCoins string, testnet bool) (bchain.BlockChainParser, bchain.BlockChain, common.Config) {
+	timeNow = fixedTimeNow
+	parser := btc.NewBitcoinParser(
+		btc.GetChainParams("test"),
+		&btc.Configuration{
+			BlockAddressesToKeep:  1,
+			XPubMagic:             70617039,
+			XPubMagicSegwitP2sh:   71979618,
+			XPubMagicSegwitNative: 73342198,
+			Slip44:                1,
+		})
+
+	var (
+		chain bchain.BlockChain
+		err   error
+	)
+	if testnet {
+		chain, err = dbtestdata.NewFakeJunoCashTestnetBlockChain(parser, totalCoins)
+	} else {
+		chain, err = dbtestdata.NewFakeJunoCashBlockChain(parser, totalCoins)
+	}
+	if err != nil {
+		glog.Fatal("fake junocash chain: ", err)
+	}
+
+	config := common.Config{
+		CoinName:        coinName,
+		CoinLabel:       coinName,
+		CoinShortcut:    coinShortcut,
+		FiatRates:       "coingecko",
+		FiatRatesParams: `{"url": "none", "coin": "ethereum","platformIdentifier": "ethereum","platformVsCurrency": "usd","periodSeconds": 60}`,
+	}
+	return parser, chain, config
+}
+
 func Test_PublicServer_BitcoinType(t *testing.T) {
 	parser, chain := setupChain(t)
 
@@ -1591,6 +1628,104 @@ func Test_PublicServer_BitcoinType(t *testing.T) {
 	httpTestsBitcoinType(t, ts)
 	socketioTestsBitcoinType(t, ts)
 	runWebsocketTests(t, ts, websocketTestsBitcoinType)
+}
+
+func Test_PublicServer_GetTotalCoinsJunocash(t *testing.T) {
+	tests := []struct {
+		name         string
+		coinName     string
+		coinShortcut string
+		testnet      bool
+	}{
+		{
+			name:         "mainnet",
+			coinName:     "Junocash",
+			coinShortcut: "JUNO",
+		},
+		{
+			name:         "testnet",
+			coinName:     "Junocash Testnet",
+			coinShortcut: "TJUNO",
+			testnet:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser, chain, config := setupJunoChain(t, tt.coinName, tt.coinShortcut, "1449793.74990004", tt.testnet)
+			s, dbpath := setupPublicHTTPServerWithConfig(parser, chain, t, false, config)
+			defer closeAndDestroyPublicServer(t, s, dbpath)
+			s.ConnectFullPublicInterface()
+
+			si, err := s.api.GetSystemInfo(false)
+			if err != nil {
+				t.Fatalf("GetSystemInfo() error = %v", err)
+			}
+			if si.Backend.TotalCoins != "1449793.74990004" {
+				t.Fatalf("GetSystemInfo().Backend.TotalCoins = %q, want %q", si.Backend.TotalCoins, "1449793.74990004")
+			}
+
+			ts := httptest.NewServer(s.https.Handler)
+			defer ts.Close()
+
+			performHttpTests([]httpTests{
+				{
+					name:        "apiGetTotalCoins default",
+					r:           newGetRequest(ts.URL + "/api/gettotalcoins"),
+					status:      http.StatusOK,
+					contentType: "application/json; charset=utf-8",
+					body:        []string{`{"totalCoins":"1449793.74990004"}`},
+				},
+				{
+					name:        "apiGetTotalCoins v2",
+					r:           newGetRequest(ts.URL + "/api/v2/gettotalcoins"),
+					status:      http.StatusOK,
+					contentType: "application/json; charset=utf-8",
+					body:        []string{`{"totalCoins":"1449793.74990004"}`},
+				},
+			}, t, ts)
+		})
+	}
+}
+
+func Test_PublicServer_GetTotalCoinsUnsupportedCoin(t *testing.T) {
+	parser, chain := setupChain(t)
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	performHttpTests([]httpTests{
+		{
+			name:        "apiGetTotalCoins unsupported",
+			r:           newGetRequest(ts.URL + "/api/gettotalcoins"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body:        []string{`{"error":"Endpoint 'gettotalcoins' is only supported for Junocash"}`},
+		},
+	}, t, ts)
+}
+
+func Test_PublicServer_GetTotalCoinsUnavailable(t *testing.T) {
+	parser, chain, config := setupJunoChain(t, "Junocash", "JUNO", "", false)
+	s, dbpath := setupPublicHTTPServerWithConfig(parser, chain, t, false, config)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	performHttpTests([]httpTests{
+		{
+			name:        "apiGetTotalCoins unavailable",
+			r:           newGetRequest(ts.URL + "/api/gettotalcoins"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body:        []string{`{"error":"Total coins are unavailable from the Junocash backend"}`},
+		},
+	}, t, ts)
 }
 
 func httpTestsBitcoinTypeExtendedIndex(t *testing.T, ts *httptest.Server) {

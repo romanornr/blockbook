@@ -201,6 +201,7 @@ type ChainInfo struct {
 	Headers          int         `json:"headers" ts_doc:"Number of block headers in the chain (can be ahead of full blocks)."`
 	Bestblockhash    string      `json:"bestblockhash" ts_doc:"Hash of the best (latest) block."`
 	Difficulty       string      `json:"difficulty" ts_doc:"Current difficulty of the network."`
+	TotalCoins       string      `json:"totalCoins,omitempty" ts_doc:"Optional total minted coins reported by the backend in whole-coin units."`
 	SizeOnDisk       int64       `json:"size_on_disk" ts_doc:"Size of the blockchain data on disk in bytes."`
 	Version          string      `json:"version" ts_doc:"Version of the blockchain backend."`
 	Subversion       string      `json:"subversion" ts_doc:"Subversion string of the blockchain backend."`

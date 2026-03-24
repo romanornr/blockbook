@@ -18,6 +18,7 @@ See all the referred types (`typescript` interfaces) in the [blockbook-api.ts](.
 The following methods are supported:
 
 -   [Status](#status)
+-   [Get total coins (Junocash only)](#get-total-coins-junocash-only)
 -   [Get block hash](#get-block-hash)
 -   [Get transaction](#get-transaction)
 -   [Get transaction specific](#get-transaction-specific)
@@ -77,6 +78,25 @@ Response (`SystemInfo` type):
     "subversion": "/Satoshi:27.1.0/",
     "protocolVersion": "70016"
   }
+}
+```
+
+#### Get block hash
+
+#### Get total coins (Junocash only)
+
+Returns the total minted Junocash supply reported by the backend `getblockchaininfo` call. This endpoint is only available for Junocash mainnet and Junocash testnet.
+
+```
+GET /api/gettotalcoins
+GET /api/v2/gettotalcoins
+```
+
+Response:
+
+```javascript
+{
+  "totalCoins": "1449793.74990004"
 }
 ```
 

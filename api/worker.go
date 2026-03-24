@@ -2503,6 +2503,7 @@ func (w *Worker) GetSystemInfo(internal bool) (*SystemInfo, error) {
 		Chain:            ci.Chain,
 		Difficulty:       ci.Difficulty,
 		Headers:          ci.Headers,
+		TotalCoins:       ci.TotalCoins,
 		ProtocolVersion:  ci.ProtocolVersion,
 		SizeOnDisk:       ci.SizeOnDisk,
 		Subversion:       ci.Subversion,
