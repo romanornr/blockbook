@@ -83,7 +83,11 @@ func (s *PublicServer) textHandler(handler func(r *http.Request, apiVersion int)
 		data, err := handler(r, apiVersion)
 		if err != nil {
 			if apiErr, ok := err.(*api.APIError); ok {
-				http.Error(w, apiErr.Text, apiErr.HTTPStatus)
+				if apiErr.Public {
+					http.Error(w, apiErr.Error(), http.StatusBadRequest)
+				} else {
+					http.Error(w, apiErr.Error(), http.StatusInternalServerError)
+				}
 			} else {
 				glog.Error(handlerName, " error: ", err)
 				if s.debug {
