@@ -94,10 +94,10 @@ GET /api/v2/gettotalcoins
 
 Response:
 
-```javascript
-{
-  "totalCoins": "1449793.74990004"
-}
+Plain text string:
+
+```text
+1449793.74990004
 ```
 
 #### Get block hash

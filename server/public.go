@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,8 +64,43 @@ type PublicServer struct {
 	isFullInterface     bool
 }
 
-type totalCoinsResponse struct {
-	TotalCoins string `json:"totalCoins"`
+func (s *PublicServer) textHandler(handler func(r *http.Request, apiVersion int) (string, error), apiVersion int) func(w http.ResponseWriter, r *http.Request) {
+	handlerName := getFunctionName(handler)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.metrics != nil {
+			s.metrics.ExplorerPendingRequests.With((common.Labels{"method": handlerName})).Inc()
+			defer s.metrics.ExplorerPendingRequests.With((common.Labels{"method": handlerName})).Dec()
+		}
+
+		defer func() {
+			if e := recover(); e != nil {
+				glog.Error(handlerName, " recovered from panic: ", e)
+				debug.PrintStack()
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+			}
+		}()
+
+		data, err := handler(r, apiVersion)
+		if err != nil {
+			if apiErr, ok := err.(*api.APIError); ok {
+				http.Error(w, apiErr.Text, apiErr.HTTPStatus)
+			} else {
+				glog.Error(handlerName, " error: ", err)
+				if s.debug {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+				} else {
+					http.Error(w, "Internal server error", http.StatusInternalServerError)
+				}
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, err = w.Write([]byte(data))
+		if err != nil {
+			glog.Warning("text write ", err)
+		}
+	}
 }
 
 // NewPublicServer creates new public server http interface to blockbook and returns its handle
@@ -201,7 +237,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/sendtx/", s.jsonHandler(s.apiSendTx, apiDefault))
 	serveMux.HandleFunc(path+"api/estimatefee/", s.jsonHandler(s.apiEstimateFee, apiDefault))
 	serveMux.HandleFunc(path+"api/balancehistory/", s.jsonHandler(s.apiBalanceHistory, apiDefault))
-	serveMux.HandleFunc(path+"api/gettotalcoins", s.jsonHandler(s.apiGetTotalCoins, apiDefault))
+	serveMux.HandleFunc(path+"api/gettotalcoins", s.textHandler(s.apiGetTotalCoins, apiDefault))
 	// v2 format
 	serveMux.HandleFunc(path+"api/v2/block-index/", s.jsonHandler(s.apiBlockIndex, apiV2))
 	serveMux.HandleFunc(path+"api/v2/block-filters/", s.jsonHandler(s.apiBlockFilters, apiV2))
@@ -216,7 +252,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/v2/estimatefee/", s.jsonHandler(s.apiEstimateFee, apiV2))
 	serveMux.HandleFunc(path+"api/v2/feestats/", s.jsonHandler(s.apiFeeStats, apiV2))
 	serveMux.HandleFunc(path+"api/v2/balancehistory/", s.jsonHandler(s.apiBalanceHistory, apiDefault))
-	serveMux.HandleFunc(path+"api/v2/gettotalcoins", s.jsonHandler(s.apiGetTotalCoins, apiV2))
+	serveMux.HandleFunc(path+"api/v2/gettotalcoins", s.textHandler(s.apiGetTotalCoins, apiV2))
 	serveMux.HandleFunc(path+"api/v2/tickers/", s.jsonHandler(s.apiTickers, apiV2))
 	serveMux.HandleFunc(path+"api/v2/multi-tickers/", s.jsonHandler(s.apiMultiTickers, apiV2))
 	serveMux.HandleFunc(path+"api/v2/tickers-list/", s.jsonHandler(s.apiAvailableVsCurrencies, apiV2))
@@ -1198,20 +1234,18 @@ func (s *PublicServer) isJunoCashChain() bool {
 	}
 }
 
-func (s *PublicServer) apiGetTotalCoins(r *http.Request, apiVersion int) (interface{}, error) {
+func (s *PublicServer) apiGetTotalCoins(r *http.Request, apiVersion int) (string, error) {
 	if !s.isJunoCashChain() {
-		return nil, api.NewAPIError("Endpoint 'gettotalcoins' is only supported for Junocash", true)
+		return "", api.NewAPIError("Endpoint 'gettotalcoins' is only supported for Junocash", true)
 	}
 	si, err := s.api.GetSystemInfo(false)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if si == nil || si.Backend == nil || si.Backend.TotalCoins == "" {
-		return nil, api.NewAPIError("Total coins are unavailable from the Junocash backend", true)
+		return "", api.NewAPIError("Total coins are unavailable from the Junocash backend", true)
 	}
-	return totalCoinsResponse{
-		TotalCoins: si.Backend.TotalCoins,
-	}, nil
+	return si.Backend.TotalCoins, nil
 }
 
 func (s *PublicServer) apiBlockFilters(r *http.Request, apiVersion int) (interface{}, error) {
