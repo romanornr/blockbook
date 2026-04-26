@@ -277,6 +277,42 @@ func TestBlockbookServiceTemplateGatesWantsLine(t *testing.T) {
 	}
 }
 
+func TestJunocashBlockchainCfgEnablesCoingeckoFiatRates(t *testing.T) {
+	configsDir := filepath.Clean(filepath.Join("..", "..", "configs"))
+
+	config, err := LoadConfig(configsDir, "junocash")
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	templ := config.ParseTemplate()
+	templ = template.Must(templ.ParseFiles(filepath.Join("..", "templates", "blockbook", "blockchaincfg.json")))
+
+	var blockchainCfg bytes.Buffer
+	if err := templ.ExecuteTemplate(&blockchainCfg, "main", config); err != nil {
+		t.Fatalf("ExecuteTemplate(blockchaincfg) error = %v", err)
+	}
+
+	var renderedCfg struct {
+		FiatRates             string `json:"fiat_rates"`
+		FiatRatesVsCurrencies string `json:"fiat_rates_vs_currencies"`
+		FiatRatesParams       string `json:"fiat_rates_params"`
+	}
+	if err := json.Unmarshal(blockchainCfg.Bytes(), &renderedCfg); err != nil {
+		t.Fatalf("json.Unmarshal(blockchaincfg) error = %v", err)
+	}
+
+	if renderedCfg.FiatRates != "coingecko" {
+		t.Fatalf("fiat_rates = %q, want %q", renderedCfg.FiatRates, "coingecko")
+	}
+	if !strings.Contains(renderedCfg.FiatRatesVsCurrencies, "USD") || !strings.Contains(renderedCfg.FiatRatesVsCurrencies, "EUR") {
+		t.Fatalf("fiat_rates_vs_currencies = %q, want at least USD and EUR", renderedCfg.FiatRatesVsCurrencies)
+	}
+	if !strings.Contains(renderedCfg.FiatRatesParams, `"coin": "junocash"`) {
+		t.Fatalf("fiat_rates_params = %q, want Coingecko coin junocash", renderedCfg.FiatRatesParams)
+	}
+}
+
 func TestEthereumClassicRPCAndBackendHTTPPortStayAligned(t *testing.T) {
 	configsDir := filepath.Clean(filepath.Join("..", "..", "configs"))
 
