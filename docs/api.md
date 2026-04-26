@@ -17,19 +17,26 @@ See all the referred types (`typescript` interfaces) in the [blockbook-api.ts](.
 
 The following methods are supported:
 
--   [Status](#status)
--   [Get total coins (Junocash only)](#get-total-coins-junocash-only)
--   [Get block hash](#get-block-hash)
--   [Get transaction](#get-transaction)
--   [Get transaction specific](#get-transaction-specific)
--   [Get address](#get-address)
--   [Get xpub](#get-xpub)
--   [Get utxo](#get-utxo)
--   [Get block](#get-block)
--   [Send transaction](#send-transaction)
--   [Tickers list](#tickers-list)
--   [Tickers](#tickers)
--   [Balance history](#balance-history)
+- [Blockbook API](#blockbook-api)
+  - [API V2](#api-v2)
+    - [REST API](#rest-api)
+      - [Status page](#status-page)
+      - [Get total coins (Junocash only)](#get-total-coins-junocash-only)
+      - [Get block hash](#get-block-hash)
+      - [Get transaction](#get-transaction)
+      - [Get transaction specific](#get-transaction-specific)
+      - [Get address](#get-address)
+      - [Get xpub](#get-xpub)
+      - [Get utxo](#get-utxo)
+      - [Get block](#get-block)
+      - [Send transaction](#send-transaction)
+      - [Tickers list](#tickers-list)
+      - [Tickers](#tickers)
+      - [Balance history](#balance-history)
+    - [Websocket API](#websocket-api)
+  - [Legacy API V1](#legacy-api-v1)
+    - [REST API](#rest-api-1)
+    - [Socket.io API](#socketio-api)
 
 #### Status page
 
@@ -49,7 +56,7 @@ Response (`SystemInfo` type):
     "coin": "Bitcoin",
     "network": "BTC",
     "host": "backend5",
-    "version": "0.5.0",
+    "version": "0.5.1",
     "gitCommit": "a0960c8e",
     "buildTime": "2024-08-08T12:32:50+00:00",
     "syncMode": true,
@@ -80,8 +87,6 @@ Response (`SystemInfo` type):
   }
 }
 ```
-
-#### Get block hash
 
 #### Get total coins (Junocash only)
 
@@ -813,6 +818,8 @@ GET /api/v2/sendtx/<hex tx data>
 POST /api/v2/sendtx/ (hex tx data in request body)  NB: the '/' symbol at the end is mandatory.
 ```
 
+POST request body is limited to 8 MiB.
+
 Response:
 
 ```javascript
@@ -1024,7 +1031,7 @@ The client can subscribe to the following events:
 
 -   `subscribeNewBlock` - new block added to blockchain
 -   `subscribeNewTransaction` - new transaction added to blockchain (all addresses)
--   `subscribeAddresses` - new transaction for a given address (list of addresses) added to mempool
+-   `subscribeAddresses` - new transaction for a given address (list of addresses) added to mempool (and optionally confirmed in a new block)
 -   `subscribeFiatRates` - new currency rate ticker
 
 There can be always only one subscription of given event per connection, i.e. new list of addresses replaces previous list of addresses.
@@ -1051,6 +1058,19 @@ Example for subscribing to an address (or multiple addresses)
   "method":"subscribeAddresses",
   "params":{
     "addresses":["mnYYiDCb2JZXnqEeXta1nkt5oCVe2RVhJj", "tb1qp0we5epypgj4acd2c4au58045ruud2pd6heuee"]
+   }
+}
+```
+
+Example for subscribing to an address (or multiple addresses) including new block (confirmed) transactions
+
+```javascript
+{
+  "id":"1",
+  "method":"subscribeAddresses",
+  "params":{
+    "addresses":["mnYYiDCb2JZXnqEeXta1nkt5oCVe2RVhJj", "tb1qp0we5epypgj4acd2c4au58045ruud2pd6heuee"],
+    "newBlockTxs": true,
    }
 }
 ```

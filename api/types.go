@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/trezor/blockbook/bchain"
-	"github.com/trezor/blockbook/bchain/coins/eth"
 	"github.com/trezor/blockbook/common"
 	"github.com/trezor/blockbook/db"
 )
@@ -173,6 +172,26 @@ type MultiTokenValue struct {
 	Value *Amount `json:"value,omitempty" ts_doc:"Amount of that specific token ID."`
 }
 
+// Erc4626TokenMetadata contains token metadata used in ERC4626 payloads.
+type Erc4626TokenMetadata struct {
+	Contract string `json:"contract" ts_doc:"Token contract address."`
+	Name     string `json:"name,omitempty" ts_doc:"Human-readable token name."`
+	Symbol   string `json:"symbol,omitempty" ts_doc:"Token symbol."`
+	Decimals int    `json:"decimals" ts_doc:"Token decimals."`
+}
+
+// Erc4626Token contains ERC4626 vault details for a fungible token.
+type Erc4626Token struct {
+	Asset                    *Erc4626TokenMetadata `json:"asset,omitempty" ts_doc:"Metadata of the underlying asset token."`
+	Share                    *Erc4626TokenMetadata `json:"share,omitempty" ts_doc:"Metadata of the vault share token."`
+	TotalAssetsSat           *Amount               `json:"totalAssets,omitempty" ts_doc:"Total underlying assets managed by the vault."`
+	ConvertToAssets1ShareSat *Amount               `json:"convertToAssets1Share,omitempty" ts_doc:"Underlying assets for one whole share unit."`
+	ConvertToShares1AssetSat *Amount               `json:"convertToShares1Asset,omitempty" ts_doc:"Shares for one whole underlying asset unit."`
+	PreviewDeposit1AssetSat  *Amount               `json:"previewDeposit1Asset,omitempty" ts_doc:"Previewed shares minted for one whole underlying asset unit."`
+	PreviewRedeem1ShareSat   *Amount               `json:"previewRedeem1Share,omitempty" ts_doc:"Previewed assets redeemed for one whole share unit."`
+	Error                    string                `json:"error,omitempty" ts_doc:"Error message for partial failures while fetching ERC4626 fields."`
+}
+
 // Token contains info about tokens held by an address
 type Token struct {
 	// Deprecated: Use Standard instead.
@@ -191,6 +210,7 @@ type Token struct {
 	MultiTokenValues []MultiTokenValue        `json:"multiTokenValues,omitempty" ts_doc:"Multiple ERC1155 token balances (id + value)."`
 	TotalReceivedSat *Amount                  `json:"totalReceived,omitempty" ts_doc:"Total amount of tokens received."`
 	TotalSentSat     *Amount                  `json:"totalSent,omitempty" ts_doc:"Total amount of tokens sent."`
+	Erc4626          *Erc4626Token            `json:"erc4626,omitempty" ts_doc:"ERC4626 vault details when requested and detected."`
 	ContractIndex    string                   `json:"-"`
 }
 
@@ -248,7 +268,7 @@ type EthereumInternalTransfer struct {
 type EthereumSpecific struct {
 	Type                 bchain.EthereumInternalTransactionType `json:"type,omitempty" ts_doc:"High-level type of the Ethereum tx (e.g., 'call', 'create')."`
 	CreatedContract      string                                 `json:"createdContract,omitempty" ts_doc:"Address of contract created by this transaction, if any."`
-	Status               eth.TxStatus                           `json:"status" ts_doc:"Execution status of the transaction (1: success, 0: fail, -1: pending)."`
+	Status               bchain.TxStatus                        `json:"status" ts_doc:"Execution status of the transaction (1: success, 0: fail, -1: pending)."`
 	Error                string                                 `json:"error,omitempty" ts_doc:"Error encountered during execution, if any."`
 	Nonce                uint64                                 `json:"nonce" ts_doc:"Transaction nonce (sequential number from the sender)."`
 	GasLimit             *big.Int                               `json:"gasLimit" ts_doc:"Maximum gas allowed by the sender for this transaction."`
@@ -296,6 +316,7 @@ type Tx struct {
 	Hex                    string            `json:"hex,omitempty" ts_doc:"Raw hex-encoded transaction data."`
 	Rbf                    bool              `json:"rbf,omitempty" ts_doc:"Indicates if this transaction is replace-by-fee (RBF) enabled."`
 	CoinSpecificData       json.RawMessage   `json:"coinSpecificData,omitempty" ts_type:"any" ts_doc:"Blockchain-specific extended data."`
+	ChainExtraData         *TxChainExtraData `json:"chainExtraData,omitempty" ts_type:"{ payloadType: 'tron'; payload?: TronChainExtraData } | { payloadType: string; payload?: any }" ts_doc:"Additional normalized chain-specific transaction data. Use payloadType as discriminator for payload."`
 	TokenTransfers         []TokenTransfer   `json:"tokenTransfers,omitempty" ts_doc:"List of token transfers that occurred in this transaction."`
 	EthereumSpecific       *EthereumSpecific `json:"ethereumSpecific,omitempty" ts_doc:"Ethereum-like blockchain specific data (if applicable)."`
 	AddressAliases         AddressAliasesMap `json:"addressAliases,omitempty" ts_doc:"Aliases for addresses involved in this transaction."`
@@ -344,6 +365,7 @@ type AddressFilter struct {
 	FromHeight     uint32         `ts_doc:"Starting block height for filtering transactions."`
 	ToHeight       uint32         `ts_doc:"Ending block height for filtering transactions."`
 	TokensToReturn TokensToReturn `ts_doc:"Which tokens to include in the result set."`
+	IncludeErc4626 bool           `ts_doc:"If true, enriches fungible EVM tokens with ERC4626 vault data when available."`
 	// OnlyConfirmed set to true will ignore mempool transactions; mempool is also ignored if FromHeight/ToHeight filter is specified
 	OnlyConfirmed bool `ts_doc:"If true, ignores mempool (unconfirmed) transactions."`
 }
@@ -388,9 +410,10 @@ type Address struct {
 	TotalSecondaryValue   float64              `json:"totalSecondaryValue,omitempty" ts_doc:"Address's entire value in secondary currency, including tokens."`
 	ContractInfo          *bchain.ContractInfo `json:"contractInfo,omitempty" ts_doc:"Extra info if the address is a contract (ABI, type)."`
 	// Deprecated: replaced by ContractInfo
-	Erc20Contract  *bchain.ContractInfo `json:"erc20Contract,omitempty" ts_doc:"@deprecated: replaced by contractInfo"`
-	AddressAliases AddressAliasesMap    `json:"addressAliases,omitempty" ts_doc:"Aliases assigned to this address."`
-	StakingPools   []StakingPool        `json:"stakingPools,omitempty" ts_doc:"List of staking pool data if address interacts with staking."`
+	Erc20Contract  *bchain.ContractInfo   `json:"erc20Contract,omitempty" ts_doc:"@deprecated: replaced by contractInfo"`
+	AddressAliases AddressAliasesMap      `json:"addressAliases,omitempty" ts_doc:"Aliases assigned to this address."`
+	StakingPools   []StakingPool          `json:"stakingPools,omitempty" ts_doc:"List of staking pool data if address interacts with staking."`
+	ChainExtraData *AccountChainExtraData `json:"chainExtraData,omitempty" ts_type:"{ payloadType: 'tron'; payload?: TronAccountExtraData } | { payloadType: string; payload?: any }" ts_doc:"Additional normalized chain-specific account/address data. Use payloadType as discriminator for payload."`
 	// helpers for explorer
 	Filter        string              `json:"-" ts_doc:"Filter used internally for data retrieval."`
 	XPubAddresses map[string]struct{} `json:"-" ts_doc:"Set of derived XPUB addresses (internal usage)."`

@@ -4,11 +4,14 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -95,6 +98,11 @@ func setupRocksDB(parser bchain.BlockChainParser, chain bchain.BlockChain, t *te
 var metrics *common.Metrics
 
 func setupPublicHTTPServer(parser bchain.BlockChainParser, chain bchain.BlockChain, t *testing.T, extendedIndex bool) (*PublicServer, string) {
+	return setupPublicHTTPServerWithFiatFixture(parser, chain, t, extendedIndex, nil)
+}
+
+func setupPublicHTTPServerWithFiatFixture(parser bchain.BlockChainParser, chain bchain.BlockChain, t *testing.T, extendedIndex bool, fiatFixture func(*db.RocksDB) error) (*PublicServer, string) {
+	// config with mocked CoinGecko API
 	config := common.Config{
 		CoinName:        "Fakecoin",
 		CoinLabel:       "Fake Coin",
@@ -112,6 +120,11 @@ func setupPublicHTTPServerWithConfig(parser bchain.BlockChainParser, chain bchai
 	}
 
 	d, is, path := setupRocksDB(parser, chain, t, extendedIndex, &config)
+	if fiatFixture != nil {
+		if err := fiatFixture(d); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	var err error
 	// metrics can be setup only once
@@ -184,6 +197,35 @@ func newPostRequest(u string, body string) *http.Request {
 	return r
 }
 
+type repeatedByteReader struct {
+	remaining int64
+}
+
+func (r *repeatedByteReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := int64(len(p))
+	if n > r.remaining {
+		n = r.remaining
+	}
+	for i := int64(0); i < n; i++ {
+		p[i] = '0'
+	}
+	r.remaining -= n
+	return int(n), nil
+}
+
+func newPostRequestWithContentLength(u string, contentLength int64) *http.Request {
+	r, err := http.NewRequest("POST", u, &repeatedByteReader{remaining: contentLength})
+	if err != nil {
+		glog.Fatal(err)
+	}
+	r.Header.Add("Content-Type", "application/octet-stream")
+	r.ContentLength = contentLength
+	return r
+}
+
 func insertFiatRate(date string, rates map[string]float32, tokenRates map[string]float32, d *db.RocksDB) error {
 	convertedDate, err := time.Parse("20060102150405", date)
 	if err != nil {
@@ -248,6 +290,29 @@ type httpTests struct {
 	body        []string
 }
 
+type fiatTickerResponse struct {
+	Timestamp int64              `json:"ts"`
+	Rates     map[string]float32 `json:"rates"`
+}
+
+type fiatTickersListResponse struct {
+	Timestamp int64    `json:"ts"`
+	Tickers   []string `json:"available_currencies"`
+}
+
+type balanceHistoryResponse struct {
+	Time       uint32             `json:"time"`
+	Txs        uint32             `json:"txs"`
+	Received   string             `json:"received"`
+	Sent       string             `json:"sent"`
+	SentToSelf string             `json:"sentToSelf"`
+	Rates      map[string]float32 `json:"rates"`
+}
+
+type apiErrorResponse struct {
+	Error string `json:"error"`
+}
+
 func performHttpTests(tests []httpTests, t *testing.T, ts *httptest.Server) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -275,6 +340,58 @@ func performHttpTests(tests []httpTests, t *testing.T, ts *httptest.Server) {
 			}
 		})
 	}
+}
+
+func mustGetJSON(t *testing.T, endpointURL string, statusCode int, out interface{}) {
+	t.Helper()
+
+	resp, err := http.DefaultClient.Do(newGetRequest(endpointURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != statusCode {
+		t.Fatalf("StatusCode = %v, want %v, body = %s", resp.StatusCode, statusCode, string(body))
+	}
+	if contentType := resp.Header.Get("Content-Type"); contentType != "application/json; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want %q", contentType, "application/json; charset=utf-8")
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		t.Fatalf("failed to decode JSON body %q: %v", string(body), err)
+	}
+}
+
+func TestReadSendTxHexFromBody(t *testing.T) {
+	const maxBodyLen int64 = 6
+	assertAPIError := func(t *testing.T, err error, want string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("expected error %q, got nil", want)
+		}
+		if err.Error() != want {
+			t.Fatalf("unexpected error %q, want %q", err.Error(), want)
+		}
+	}
+
+	t.Run("accepts body exactly at limit", func(t *testing.T) {
+		got, err := readSendTxHexFromBody(strings.NewReader("123456"), maxBodyLen)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "123456" {
+			t.Fatalf("got %q, want %q", got, "123456")
+		}
+	})
+
+	t.Run("rejects body larger than limit by one byte", func(t *testing.T) {
+		_, err := readSendTxHexFromBody(strings.NewReader("1234567"), maxBodyLen)
+		assertAPIError(t, err, "Tx blob too large")
+	})
 }
 
 func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
@@ -630,6 +747,42 @@ func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 			},
 		},
 		{
+			name:        "apiTickerList missing timestamp",
+			r:           newGetRequest(ts.URL + "/api/v2/tickers-list"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body: []string{
+				`{"error":"Parameter \"timestamp\" is not a valid Unix timestamp."}`,
+			},
+		},
+		{
+			name:        "apiTickerList invalid timestamp",
+			r:           newGetRequest(ts.URL + "/api/v2/tickers-list?timestamp=abc"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body: []string{
+				`{"error":"Parameter \"timestamp\" is not a valid Unix timestamp."}`,
+			},
+		},
+		{
+			name:        "apiMultiFiatRates missing timestamp",
+			r:           newGetRequest(ts.URL + "/api/v2/multi-tickers"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body: []string{
+				`{"error":"Parameter 'timestamp' is missing."}`,
+			},
+		},
+		{
+			name:        "apiMultiFiatRates invalid timestamp item",
+			r:           newGetRequest(ts.URL + "/api/v2/multi-tickers?timestamp=1574344800,abc&currency=usd"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body: []string{
+				`{"error":"Parameter 'timestamp' does not contain a valid Unix timestamp."}`,
+			},
+		},
+		{
 			name:        "apiAddress v1",
 			r:           newGetRequest(ts.URL + "/api/v1/address/mv9uLThosiEnGRbVPS7Vhyw6VssbVRsiAw"),
 			status:      http.StatusOK,
@@ -891,6 +1044,15 @@ func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 			},
 		},
 		{
+			name:        "apiSendTx POST too large",
+			r:           newPostRequestWithContentLength(ts.URL+"/api/v2/sendtx/", maxSendTxBodyBytes+1),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body: []string{
+				`{"error":"Tx blob too large"}`,
+			},
+		},
+		{
 			name:        "apiEstimateFee",
 			r:           newGetRequest(ts.URL + "/api/estimatefee/123?conservative=false"),
 			status:      http.StatusOK,
@@ -979,6 +1141,30 @@ func socketioTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 			want: `{"result":["7c3be24063f268aaa1ed81b64776798f56088757641a34fb156c4f51ed2e9d25"]}`,
 		},
 		{
+			name: "socketio getAddressTxids invalid start",
+			req: socketioReq{"getAddressTxids", []interface{}{
+				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
+				map[string]interface{}{
+					"start":        -1,
+					"end":          0,
+					"queryMempool": false,
+				},
+			}},
+			want: `{"error":{"message":"Invalid parameter start"}}`,
+		},
+		{
+			name: "socketio getAddressTxids invalid end",
+			req: socketioReq{"getAddressTxids", []interface{}{
+				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
+				map[string]interface{}{
+					"start":        2000000,
+					"end":          -1,
+					"queryMempool": false,
+				},
+			}},
+			want: `{"error":{"message":"Invalid parameter end"}}`,
+		},
+		{
 			name: "socketio getAddressHistory",
 			req: socketioReq{"getAddressHistory", []interface{}{
 				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
@@ -991,6 +1177,48 @@ func socketioTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 				},
 			}},
 			want: `{"result":{"totalCount":2,"items":[{"addresses":{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz":{"inputIndexes":[1],"outputIndexes":[]}},"satoshis":-12345,"confirmations":1,"tx":{"hex":"","height":225494,"blockTimestamp":1521595678,"version":0,"hash":"7c3be24063f268aaa1ed81b64776798f56088757641a34fb156c4f51ed2e9d25","inputs":[{"txid":"effd9ef509383d536b1c8af5bf434c8efbf521a4f2befd4022bbd68694b4ac75","outputIndex":0,"script":"","sequence":0,"address":"mv9uLThosiEnGRbVPS7Vhyw6VssbVRsiAw","satoshis":1234567890123},{"txid":"00b2c06055e5e90e9c82bd4181fde310104391a7fa4f289b1704e5d90caa3840","outputIndex":1,"script":"","sequence":0,"address":"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz","satoshis":12345}],"inputSatoshis":1234567902468,"outputs":[{"satoshis":317283951061,"script":"76a914ccaaaf374e1b06cb83118453d102587b4273d09588ac","address":"mzB8cYrfRwFRFAGTDzV8LkUQy5BQicxGhX"},{"satoshis":917283951061,"script":"76a9148d802c045445df49613f6a70ddd2e48526f3701f88ac","address":"mtR97eM2HPWVM6c8FGLGcukgaHHQv7THoL"},{"satoshis":0,"script":"6a072020f1686f6a20","address":"OP_RETURN 2020f1686f6a20"}],"outputSatoshis":1234567902122,"feeSatoshis":346}},{"addresses":{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz":{"inputIndexes":[],"outputIndexes":[1,2]}},"satoshis":24690,"confirmations":2,"tx":{"hex":"","height":225493,"blockTimestamp":1521515026,"version":0,"hash":"00b2c06055e5e90e9c82bd4181fde310104391a7fa4f289b1704e5d90caa3840","inputs":[],"outputs":[{"satoshis":100000000,"script":"76a914010d39800f86122416e28f485029acf77507169288ac","address":"mfcWp7DB6NuaZsExybTTXpVgWz559Np4Ti"},{"satoshis":12345,"script":"76a9148bdf0aa3c567aa5975c2e61321b8bebbe7293df688ac","address":"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},{"satoshis":12345,"script":"76a9148bdf0aa3c567aa5975c2e61321b8bebbe7293df688ac","address":"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"}],"outputSatoshis":100024690}}]}}`,
+		},
+		{
+			name: "socketio getAddressHistory invalid from",
+			req: socketioReq{"getAddressHistory", []interface{}{
+				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
+				map[string]interface{}{
+					"start":        2000000,
+					"end":          0,
+					"queryMempool": false,
+					"from":         -1,
+					"to":           5,
+				},
+			}},
+			want: `{"error":{"message":"Invalid parameter from"}}`,
+		},
+		{
+			name: "socketio getAddressHistory invalid to",
+			req: socketioReq{"getAddressHistory", []interface{}{
+				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
+				map[string]interface{}{
+					"start":        2000000,
+					"end":          0,
+					"queryMempool": false,
+					"from":         0,
+					"to":           -1,
+				},
+			}},
+			want: `{"error":{"message":"Invalid parameter to"}}`,
+		},
+		{
+			name: "socketio getAddressHistory invalid start",
+			req: socketioReq{"getAddressHistory", []interface{}{
+				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
+				map[string]interface{}{
+					"start":        -1,
+					"end":          0,
+					"queryMempool": false,
+					"from":         0,
+					"to":           5,
+				},
+			}},
+			want: `{"error":{"message":"Invalid parameter start"}}`,
 		},
 		{
 			name: "socketio getBlockHeader",
@@ -1031,10 +1259,103 @@ type websocketResp struct {
 	ID string `json:"id"`
 }
 
+type websocketRespWithData struct {
+	ID   string          `json:"id"`
+	Data json.RawMessage `json:"data"`
+}
+
 type websocketTest struct {
 	name string
 	req  websocketReq
 	want string
+}
+
+func connectWebsocket(t *testing.T, ts *httptest.Server) *websocket.Conn {
+	t.Helper()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/websocket"
+	s, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func readWebsocketResponse(t *testing.T, s *websocket.Conn, timeout time.Duration) websocketRespWithData {
+	t.Helper()
+	if err := s.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	defer s.SetReadDeadline(time.Time{})
+
+	_, message, err := s.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp websocketRespWithData
+	if err := json.Unmarshal(message, &resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func assertNoWebsocketMessage(t *testing.T, s *websocket.Conn, timeout time.Duration) {
+	t.Helper()
+	if err := s.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := s.ReadMessage()
+	s.SetReadDeadline(time.Time{})
+	if err == nil {
+		t.Fatal("expected no websocket message, got one")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+}
+
+func Test_WebsocketRejectsOversizedMessage(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	ws := connectWebsocket(t, ts)
+	defer ws.Close()
+
+	// Verify the connection is healthy before sending an oversized frame.
+	if err := ws.WriteJSON(websocketReq{ID: "0", Method: "getInfo"}); err != nil {
+		t.Fatal(err)
+	}
+	resp := readWebsocketResponse(t, ws, time.Second)
+	if resp.ID != "0" {
+		t.Fatalf("got response id %q, want %q", resp.ID, "0")
+	}
+
+	payload := strings.Repeat("a", int(maxWebsocketMessageBytes)+1)
+	if err := ws.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ws.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := ws.ReadMessage()
+	ws.SetReadDeadline(time.Time{})
+	if err == nil {
+		t.Fatal("expected websocket read error after oversized message")
+	}
+	if websocket.IsCloseError(err, websocket.CloseMessageTooBig, websocket.CloseAbnormalClosure) {
+		return
+	}
+	if errors.Is(err, io.EOF) {
+		return
+	}
+	t.Fatalf("unexpected websocket error after oversized message: %v", err)
 }
 
 var websocketTestsBitcoinType = []websocketTest{
@@ -1595,6 +1916,553 @@ func Test_PublicServer_BitcoinType(t *testing.T) {
 	runWebsocketTests(t, ts, websocketTestsBitcoinType)
 }
 
+func Test_HTTPFiatRates_CrossEndpointConsistency_BitcoinType(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	var singleByTimestamp fiatTickerResponse
+	mustGetJSON(t, ts.URL+"/api/v2/tickers?timestamp=1574344800&currency=eur", http.StatusOK, &singleByTimestamp)
+
+	var multiByTimestamp []fiatTickerResponse
+	mustGetJSON(t, ts.URL+"/api/v2/multi-tickers?timestamp=1574344800&currency=eur", http.StatusOK, &multiByTimestamp)
+	if len(multiByTimestamp) != 1 {
+		t.Fatalf("unexpected multi ticker count: got %d, want %d", len(multiByTimestamp), 1)
+	}
+	if !reflect.DeepEqual(singleByTimestamp, multiByTimestamp[0]) {
+		t.Fatalf("tickers and multi-tickers mismatch: got %v vs %v", singleByTimestamp, multiByTimestamp[0])
+	}
+
+	var byBlock fiatTickerResponse
+	mustGetJSON(t, ts.URL+"/api/v2/tickers?block=225494&currency=usd", http.StatusOK, &byBlock)
+
+	var byBlockTime fiatTickerResponse
+	mustGetJSON(t, ts.URL+"/api/v2/tickers?timestamp=1521595678&currency=usd", http.StatusOK, &byBlockTime)
+	if !reflect.DeepEqual(byBlock, byBlockTime) {
+		t.Fatalf("block and timestamp ticker mismatch: got %v vs %v", byBlock, byBlockTime)
+	}
+}
+
+func Test_HTTPFiatRates_Endpoints_TokenContractsCaseHandling_BitcoinType(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	const (
+		tronUSDT     = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+		ethLowercase = "0xa4dd6bc15be95af55f0447555c8b6aa3088562f3"
+		ethMixedCase = "0xA4DD6Bc15Be95Af55f0447555c8b6aA3088562f3"
+		tickerUnixTs = int64(1700000000)
+	)
+
+	s, dbpath := setupPublicHTTPServerWithFiatFixture(parser, chain, t, false, func(d *db.RocksDB) error {
+		ticker := common.CurrencyRatesTicker{
+			Timestamp: time.Unix(tickerUnixTs, 0).UTC(),
+			Rates: map[string]float32{
+				"usd": 1,
+			},
+			TokenRates: map[string]float32{
+				tronUSDT:     9,
+				ethLowercase: 4,
+			},
+		}
+		if err := insertFiatRate(ticker.Timestamp.UTC().Format(db.FiatRatesTimeFormat), ticker.Rates, ticker.TokenRates, d); err != nil {
+			return err
+		}
+		currentTickers := []common.CurrencyRatesTicker{ticker}
+		return d.FiatRatesStoreSpecialTickers("CurrentTickers", &currentTickers)
+	})
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	tests := []struct {
+		name  string
+		token string
+		want  float32
+	}{
+		{name: "tron usdt base58", token: tronUSDT, want: 9},
+		{name: "eth lowercase", token: ethLowercase, want: 4},
+		{name: "eth mixed-case", token: ethMixedCase, want: 4},
+	}
+	t.Run("tickers", func(t *testing.T) {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var got fiatTickerResponse
+				mustGetJSON(t, ts.URL+"/api/v2/tickers?currency=usd&token="+url.QueryEscape(tt.token), http.StatusOK, &got)
+				want := fiatTickerResponse{
+					Timestamp: tickerUnixTs,
+					Rates:     map[string]float32{"usd": tt.want},
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("unexpected ticker for token %q: got %v, want %v", tt.token, got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("multi-tickers", func(t *testing.T) {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var got []fiatTickerResponse
+				u := ts.URL + "/api/v2/multi-tickers?timestamp=" + strconv.FormatInt(tickerUnixTs, 10) + "&currency=usd&token=" + url.QueryEscape(tt.token)
+				mustGetJSON(t, u, http.StatusOK, &got)
+				want := []fiatTickerResponse{
+					{
+						Timestamp: tickerUnixTs,
+						Rates:     map[string]float32{"usd": tt.want},
+					},
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("unexpected multi-tickers for token %q: got %v, want %v", tt.token, got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("tickers-list", func(t *testing.T) {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var got fiatTickersListResponse
+				u := ts.URL + "/api/v2/tickers-list?timestamp=" + strconv.FormatInt(tickerUnixTs, 10) + "&token=" + url.QueryEscape(tt.token)
+				mustGetJSON(t, u, http.StatusOK, &got)
+				want := fiatTickersListResponse{
+					Timestamp: tickerUnixTs,
+					Tickers:   []string{"usd"},
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("unexpected tickers-list for token %q: got %v, want %v", tt.token, got, want)
+				}
+			})
+		}
+	})
+}
+
+func Test_HTTPBalanceHistory_GroupByAndInvalidCurrency_BitcoinType(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	addr := "2NEVv9LJmAnY99W1pFoc5UJjVdypBqdnvu1"
+
+	var grouped []balanceHistoryResponse
+	mustGetJSON(
+		t,
+		ts.URL+"/api/v2/balancehistory/"+addr+"?groupBy=200000&fiatcurrency=eur",
+		http.StatusOK,
+		&grouped,
+	)
+	wantGrouped := []balanceHistoryResponse{
+		{
+			Time:       1521400000,
+			Txs:        2,
+			Received:   "18876",
+			Sent:       "9876",
+			SentToSelf: "9000",
+			Rates:      map[string]float32{"eur": 1300},
+		},
+	}
+	if !reflect.DeepEqual(grouped, wantGrouped) {
+		t.Fatalf("unexpected grouped balance history: got %v, want %v", grouped, wantGrouped)
+	}
+
+	var invalidCurrency []balanceHistoryResponse
+	mustGetJSON(
+		t,
+		ts.URL+"/api/v2/balancehistory/"+addr+"?fiatcurrency=does_not_exist",
+		http.StatusOK,
+		&invalidCurrency,
+	)
+	if len(invalidCurrency) != 2 {
+		t.Fatalf("unexpected invalid-currency balance history count: got %d, want %d", len(invalidCurrency), 2)
+	}
+	for i := range invalidCurrency {
+		if !reflect.DeepEqual(invalidCurrency[i].Rates, map[string]float32{"does_not_exist": -1}) {
+			t.Fatalf("unexpected invalid-currency rates at index %d: got %v", i, invalidCurrency[i].Rates)
+		}
+	}
+}
+
+func Test_WebsocketFiatRates_SubscribeBroadcastAndUnsubscribe(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	ws := connectWebsocket(t, ts)
+	defer ws.Close()
+
+	token := "0xa4dd6bc15be95af55f0447555c8b6aa3088562f3"
+	subscribe := websocketReq{
+		ID:     "sub-fiat",
+		Method: "subscribeFiatRates",
+		Params: map[string]interface{}{
+			"currency": "USD",
+			"tokens":   []string{strings.ToUpper(token)},
+		},
+	}
+	if err := ws.WriteJSON(subscribe); err != nil {
+		t.Fatal(err)
+	}
+	ack := readWebsocketResponse(t, ws, time.Second)
+	if ack.ID != subscribe.ID {
+		t.Fatalf("unexpected subscribe response id: got %q, want %q", ack.ID, subscribe.ID)
+	}
+	var ackData struct {
+		Subscribed bool `json:"subscribed"`
+	}
+	if err := json.Unmarshal(ack.Data, &ackData); err != nil {
+		t.Fatal(err)
+	}
+	if !ackData.Subscribed {
+		t.Fatalf("expected subscribed=true, got false")
+	}
+
+	ticker := &common.CurrencyRatesTicker{
+		Timestamp: time.Unix(1700000000, 0),
+		Rates: map[string]float32{
+			"usd": 2.5,
+			"eur": 1.1,
+		},
+		TokenRates: map[string]float32{
+			token: 4,
+		},
+	}
+	expectedTokenRate := ticker.TokenRateInCurrency(token, "usd")
+	s.OnNewFiatRatesTicker(ticker)
+
+	push := readWebsocketResponse(t, ws, time.Second)
+	if push.ID != subscribe.ID {
+		t.Fatalf("unexpected push response id: got %q, want %q", push.ID, subscribe.ID)
+	}
+	var pushData struct {
+		Rates      map[string]float32 `json:"rates"`
+		TokenRates map[string]float32 `json:"tokenRates,omitempty"`
+	}
+	if err := json.Unmarshal(push.Data, &pushData); err != nil {
+		t.Fatal(err)
+	}
+	if len(pushData.Rates) != 1 || pushData.Rates["usd"] != 2.5 {
+		t.Fatalf("unexpected pushed rates: %v", pushData.Rates)
+	}
+	upperToken := strings.ToUpper(token)
+	if len(pushData.TokenRates) != 1 || pushData.TokenRates[upperToken] != expectedTokenRate {
+		t.Fatalf("unexpected pushed token rates: %v", pushData.TokenRates)
+	}
+
+	unsubscribe := websocketReq{
+		ID:     "unsub-fiat",
+		Method: "unsubscribeFiatRates",
+	}
+	if err := ws.WriteJSON(unsubscribe); err != nil {
+		t.Fatal(err)
+	}
+	unsubAck := readWebsocketResponse(t, ws, time.Second)
+	if unsubAck.ID != unsubscribe.ID {
+		t.Fatalf("unexpected unsubscribe response id: got %q, want %q", unsubAck.ID, unsubscribe.ID)
+	}
+	var unsubData struct {
+		Subscribed bool `json:"subscribed"`
+	}
+	if err := json.Unmarshal(unsubAck.Data, &unsubData); err != nil {
+		t.Fatal(err)
+	}
+	if unsubData.Subscribed {
+		t.Fatalf("expected subscribed=false after unsubscribe")
+	}
+
+	s.OnNewFiatRatesTicker(&common.CurrencyRatesTicker{
+		Timestamp: time.Unix(1700000060, 0),
+		Rates: map[string]float32{
+			"usd": 3.5,
+		},
+		TokenRates: map[string]float32{
+			token: 5,
+		},
+	})
+	assertNoWebsocketMessage(t, ws, 300*time.Millisecond)
+}
+
+func Test_WebsocketFiatRates_GetCurrentFiatRates_TokenContractsCaseHandling_BitcoinType(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	const (
+		tronUSDT     = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+		ethLowercase = "0xa4dd6bc15be95af55f0447555c8b6aa3088562f3"
+		ethMixedCase = "0xA4DD6Bc15Be95Af55f0447555c8b6aA3088562f3"
+		tickerUnixTs = int64(1700000000)
+	)
+
+	s, dbpath := setupPublicHTTPServerWithFiatFixture(parser, chain, t, false, func(d *db.RocksDB) error {
+		ticker := common.CurrencyRatesTicker{
+			Timestamp: time.Unix(tickerUnixTs, 0).UTC(),
+			Rates: map[string]float32{
+				"usd": 1,
+			},
+			TokenRates: map[string]float32{
+				tronUSDT:     9,
+				ethLowercase: 4,
+			},
+		}
+		if err := insertFiatRate(ticker.Timestamp.UTC().Format(db.FiatRatesTimeFormat), ticker.Rates, ticker.TokenRates, d); err != nil {
+			return err
+		}
+		currentTickers := []common.CurrencyRatesTicker{ticker}
+		return d.FiatRatesStoreSpecialTickers("CurrentTickers", &currentTickers)
+	})
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	ws := connectWebsocket(t, ts)
+	defer ws.Close()
+
+	tests := []struct {
+		name  string
+		id    string
+		token string
+		want  float32
+	}{
+		{name: "tron usdt base58", id: "ws-tron", token: tronUSDT, want: 9},
+		{name: "eth lowercase", id: "ws-eth-lower", token: ethLowercase, want: 4},
+		{name: "eth mixed-case", id: "ws-eth-mixed", token: ethMixedCase, want: 4},
+	}
+
+	t.Run("getCurrentFiatRates", func(t *testing.T) {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := websocketReq{
+					ID:     tt.id + "-current",
+					Method: "getCurrentFiatRates",
+					Params: map[string]interface{}{
+						"currencies": []string{"usd"},
+						"token":      tt.token,
+					},
+				}
+				if err := ws.WriteJSON(req); err != nil {
+					t.Fatal(err)
+				}
+				resp := readWebsocketResponse(t, ws, time.Second)
+				if resp.ID != req.ID {
+					t.Fatalf("unexpected response id: got %q, want %q", resp.ID, req.ID)
+				}
+
+				var got fiatTickerResponse
+				if err := json.Unmarshal(resp.Data, &got); err != nil {
+					t.Fatal(err)
+				}
+				want := fiatTickerResponse{
+					Timestamp: tickerUnixTs,
+					Rates:     map[string]float32{"usd": tt.want},
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("unexpected websocket ticker for token %q: got %v, want %v", tt.token, got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("getFiatRatesForTimestamps", func(t *testing.T) {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := websocketReq{
+					ID:     tt.id + "-timestamps",
+					Method: "getFiatRatesForTimestamps",
+					Params: map[string]interface{}{
+						"timestamps": []int64{tickerUnixTs},
+						"currencies": []string{"usd"},
+						"token":      tt.token,
+					},
+				}
+				if err := ws.WriteJSON(req); err != nil {
+					t.Fatal(err)
+				}
+				resp := readWebsocketResponse(t, ws, time.Second)
+				if resp.ID != req.ID {
+					t.Fatalf("unexpected response id: got %q, want %q", resp.ID, req.ID)
+				}
+
+				var got struct {
+					Tickers []fiatTickerResponse `json:"tickers"`
+				}
+				if err := json.Unmarshal(resp.Data, &got); err != nil {
+					t.Fatal(err)
+				}
+				want := struct {
+					Tickers []fiatTickerResponse `json:"tickers"`
+				}{
+					Tickers: []fiatTickerResponse{
+						{
+							Timestamp: tickerUnixTs,
+							Rates:     map[string]float32{"usd": tt.want},
+						},
+					},
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("unexpected websocket timestamp tickers for token %q: got %v, want %v", tt.token, got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("getFiatRatesTickersList", func(t *testing.T) {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := websocketReq{
+					ID:     tt.id + "-list",
+					Method: "getFiatRatesTickersList",
+					Params: map[string]interface{}{
+						"timestamp": tickerUnixTs,
+						"token":     tt.token,
+					},
+				}
+				if err := ws.WriteJSON(req); err != nil {
+					t.Fatal(err)
+				}
+				resp := readWebsocketResponse(t, ws, time.Second)
+				if resp.ID != req.ID {
+					t.Fatalf("unexpected response id: got %q, want %q", resp.ID, req.ID)
+				}
+
+				var got fiatTickersListResponse
+				if err := json.Unmarshal(resp.Data, &got); err != nil {
+					t.Fatal(err)
+				}
+				want := fiatTickersListResponse{
+					Timestamp: tickerUnixTs,
+					Tickers:   []string{"usd"},
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("unexpected websocket tickers list for token %q: got %v, want %v", tt.token, got, want)
+				}
+			})
+		}
+	})
+}
+
+func Test_WebsocketFiatRates_SubscribeBroadcastPreservesBase58TokenAddress(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	ws := connectWebsocket(t, ts)
+	defer ws.Close()
+
+	const tronUSDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+	subscribe := websocketReq{
+		ID:     "sub-tron-fiat",
+		Method: "subscribeFiatRates",
+		Params: map[string]interface{}{
+			"currency": "USD",
+			"tokens":   []string{tronUSDT},
+		},
+	}
+	if err := ws.WriteJSON(subscribe); err != nil {
+		t.Fatal(err)
+	}
+	_ = readWebsocketResponse(t, ws, time.Second)
+
+	ticker := &common.CurrencyRatesTicker{
+		Timestamp: time.Unix(1700000000, 0),
+		Rates: map[string]float32{
+			"usd": 2.5,
+		},
+		TokenRates: map[string]float32{
+			tronUSDT: 9,
+		},
+	}
+	s.OnNewFiatRatesTicker(ticker)
+
+	push := readWebsocketResponse(t, ws, time.Second)
+	var pushData struct {
+		TokenRates map[string]float32 `json:"tokenRates,omitempty"`
+	}
+	if err := json.Unmarshal(push.Data, &pushData); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(pushData.TokenRates, map[string]float32{tronUSDT: 9}) {
+		t.Fatalf("unexpected pushed tron token rates: %v", pushData.TokenRates)
+	}
+}
+
+func Test_WebsocketFiatRates_ResubscribeReplacesPreviousCurrency(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	s.ConnectFullPublicInterface()
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	ws := connectWebsocket(t, ts)
+	defer ws.Close()
+
+	subscribeUSD := websocketReq{
+		ID:     "sub-usd",
+		Method: "subscribeFiatRates",
+		Params: map[string]interface{}{
+			"currency": "usd",
+		},
+	}
+	if err := ws.WriteJSON(subscribeUSD); err != nil {
+		t.Fatal(err)
+	}
+	_ = readWebsocketResponse(t, ws, time.Second)
+
+	subscribeEUR := websocketReq{
+		ID:     "sub-eur",
+		Method: "subscribeFiatRates",
+		Params: map[string]interface{}{
+			"currency": "eur",
+		},
+	}
+	if err := ws.WriteJSON(subscribeEUR); err != nil {
+		t.Fatal(err)
+	}
+	_ = readWebsocketResponse(t, ws, time.Second)
+
+	s.OnNewFiatRatesTicker(&common.CurrencyRatesTicker{
+		Timestamp: time.Unix(1700000120, 0),
+		Rates: map[string]float32{
+			"usd": 100,
+			"eur": 200,
+		},
+	})
+
+	push := readWebsocketResponse(t, ws, time.Second)
+	if push.ID != subscribeEUR.ID {
+		t.Fatalf("unexpected push response id: got %q, want %q", push.ID, subscribeEUR.ID)
+	}
+	var pushData struct {
+		Rates map[string]float32 `json:"rates"`
+	}
+	if err := json.Unmarshal(push.Data, &pushData); err != nil {
+		t.Fatal(err)
+	}
+	if len(pushData.Rates) != 1 || pushData.Rates["eur"] != 200 {
+		t.Fatalf("unexpected pushed rates after resubscribe: %v", pushData.Rates)
+	}
+
+	assertNoWebsocketMessage(t, ws, 300*time.Millisecond)
+}
+
 func httpTestsBitcoinTypeExtendedIndex(t *testing.T, ts *httptest.Server) {
 	tests := []struct {
 		name        string
@@ -1774,4 +2642,39 @@ func Test_PublicServer_BitcoinType_ExtendedIndex(t *testing.T) {
 
 	httpTestsBitcoinTypeExtendedIndex(t, ts)
 	runWebsocketTests(t, ts, websocketTestsBitcoinTypeExtendedIndex)
+}
+
+func Test_validateIntParam(t *testing.T) {
+	tests := []struct {
+		name         string
+		value        string
+		defaultValue int
+		min          int
+		max          int
+		want         int
+	}{
+		{"empty string", "", 0, 0, 100, 0},
+		{"empty string with default", "", 42, 0, 100, 42},
+		{"valid value", "10", 0, 0, 100, 10},
+		{"value at min", "0", 0, 0, 100, 0},
+		{"value at max", "100", 0, 0, 100, 100},
+		{"value exceeds max", "150", 0, 0, 100, 100},
+		{"negative value", "-5", 0, 0, 100, 0},
+		{"negative value below min", "-10", 0, 0, 100, 0},
+		{"invalid string", "abc", 0, 0, 100, 0},
+		{"invalid string with default", "xyz", 42, 0, 100, 42},
+		{"zero max (no limit)", "1000", 0, 0, 0, 1000},
+		{"very large number", "9223372036854775807", 0, 0, maxPageNumber, maxPageNumber},
+		{"negative with min constraint", "-5", 0, 5, 100, 0},
+		{"whitespace", "  10  ", 0, 0, 100, 0},
+		{"zero value", "0", 0, 0, 100, 0},
+		{"max int32", "2147483647", 0, 0, 0, 2147483647},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := validateIntParam(tt.value, tt.defaultValue, tt.min, tt.max); got != tt.want {
+				t.Errorf("validateIntParam(%q, %d, %d, %d) = %d, want %d", tt.value, tt.defaultValue, tt.min, tt.max, got, tt.want)
+			}
+		})
+	}
 }

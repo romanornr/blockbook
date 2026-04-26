@@ -33,8 +33,22 @@ const txsOnPage = 25
 const blocksOnPage = 50
 const mempoolTxsOnPage = 50
 const txsInAPI = 1000
+const maxPageNumber = 1000000
+const maxGapValue = 10000
+const maxSendTxBodyBytes int64 = 8 * 1024 * 1024
 
 const secondaryCoinCookieName = "secondary_coin"
+const templatesDir = "./static/templates"
+const (
+	txBitcoinTypeTemplate         = templatesDir + "/tx_bitcointype.html"
+	txEthereumTypeTemplate        = templatesDir + "/tx_ethereumtype.html"
+	txTronTemplate                = templatesDir + "/tx_tron.html"
+	txBitcoinTypeDetailTemplate   = templatesDir + "/txdetail.html"
+	txEthereumTypeDetailTemplate  = templatesDir + "/txdetail_ethereumtype.html"
+	txTronDetailTemplate          = templatesDir + "/txdetail_tron.html"
+	addressChainExtraTemplate     = templatesDir + "/address_chainextra.html"
+	addressChainExtraTronTemplate = templatesDir + "/address_chainextra_tron.html"
+)
 
 const (
 	_ = iota
@@ -267,6 +281,11 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	s.isFullInterface = true
 }
 
+// IsFullInterface reports whether full public functionality is already enabled.
+func (s *PublicServer) IsFullInterface() bool {
+	return s.isFullInterface
+}
+
 // Close closes the server
 func (s *PublicServer) Close() error {
 	glog.Infof("public server: closing")
@@ -280,9 +299,9 @@ func (s *PublicServer) Shutdown(ctx context.Context) error {
 }
 
 // OnNewBlock notifies users subscribed to bitcoind/hashblock about new block
-func (s *PublicServer) OnNewBlock(hash string, height uint32) {
-	s.socketio.OnNewBlockHash(hash)
-	s.websocket.OnNewBlock(hash, height)
+func (s *PublicServer) OnNewBlock(block *bchain.Block) {
+	s.socketio.OnNewBlockHash(block.Hash)
+	s.websocket.OnNewBlock(block)
 }
 
 // OnNewFiatRatesTicker notifies users subscribed to bitcoind/fiatrates about new ticker
@@ -461,6 +480,41 @@ type TemplateData struct {
 	TxTicker                 *common.CurrencyRatesTicker
 }
 
+func defaultTxTemplate(chainType bchain.ChainType) string {
+	if chainType == bchain.ChainEthereumType {
+		return txEthereumTypeTemplate
+	}
+	return txBitcoinTypeTemplate
+}
+
+func resolveTxTemplate(chainType bchain.ChainType, coinShortcut string) string {
+	if strings.EqualFold(strings.TrimSpace(coinShortcut), "TRX") {
+		return txTronTemplate
+	}
+	return defaultTxTemplate(chainType)
+}
+
+func defaultTxDetailTemplate(chainType bchain.ChainType) string {
+	if chainType == bchain.ChainEthereumType {
+		return txEthereumTypeDetailTemplate
+	}
+	return txBitcoinTypeDetailTemplate
+}
+
+func resolveTxDetailTemplate(chainType bchain.ChainType, coinShortcut string) string {
+	if strings.EqualFold(strings.TrimSpace(coinShortcut), "TRX") {
+		return txTronDetailTemplate
+	}
+	return defaultTxDetailTemplate(chainType)
+}
+
+func resolveAddressChainExtraTemplate(coinShortcut string) string {
+	if strings.EqualFold(strings.TrimSpace(coinShortcut), "TRX") {
+		return addressChainExtraTronTemplate
+	}
+	return addressChainExtraTemplate
+}
+
 func (s *PublicServer) parseTemplates() []*template.Template {
 	templateFuncMap := template.FuncMap{
 		"timeSpan":                 timeSpan,
@@ -488,6 +542,7 @@ func (s *PublicServer) parseTemplates() []*template.Template {
 		"hasPrefix":                strings.HasPrefix,
 		"jsStr":                    jsStr,
 	}
+	applyTemplateFuncs(templateFuncMap)
 	var createTemplate func(filenames ...string) *template.Template
 	if s.debug {
 		createTemplate = func(filenames ...string) *template.Template {
@@ -527,20 +582,23 @@ func (s *PublicServer) parseTemplates() []*template.Template {
 		}
 	}
 	t := make([]*template.Template, publicTplCount)
+	txTemplate := resolveTxTemplate(s.chainParser.GetChainType(), s.is.CoinShortcut)
+	txDetailTemplate := resolveTxDetailTemplate(s.chainParser.GetChainType(), s.is.CoinShortcut)
+	resolvedAddressChainExtraTemplate := resolveAddressChainExtraTemplate(s.is.CoinShortcut)
 	t[errorTpl] = createTemplate("./static/templates/error.html", "./static/templates/base.html")
 	t[errorInternalTpl] = createTemplate("./static/templates/error.html", "./static/templates/base.html")
 	t[indexTpl] = createTemplate("./static/templates/index.html", "./static/templates/base.html")
 	t[blocksTpl] = createTemplate("./static/templates/blocks.html", "./static/templates/paging.html", "./static/templates/base.html")
 	t[sendTransactionTpl] = createTemplate("./static/templates/sendtx.html", "./static/templates/base.html")
 	if s.chainParser.GetChainType() == bchain.ChainEthereumType {
-		t[txTpl] = createTemplate("./static/templates/tx.html", "./static/templates/txdetail_ethereumtype.html", "./static/templates/base.html")
-		t[addressTpl] = createTemplate("./static/templates/address.html", "./static/templates/txdetail_ethereumtype.html", "./static/templates/paging.html", "./static/templates/base.html")
-		t[blockTpl] = createTemplate("./static/templates/block.html", "./static/templates/txdetail_ethereumtype.html", "./static/templates/paging.html", "./static/templates/base.html")
+		t[txTpl] = createTemplate(txTemplate, txDetailTemplate, "./static/templates/base.html")
+		t[addressTpl] = createTemplate("./static/templates/address.html", resolvedAddressChainExtraTemplate, txDetailTemplate, "./static/templates/paging.html", "./static/templates/base.html")
+		t[blockTpl] = createTemplate("./static/templates/block.html", txDetailTemplate, "./static/templates/paging.html", "./static/templates/base.html")
 		t[nftDetailTpl] = createTemplate("./static/templates/tokenDetail.html", "./static/templates/base.html")
 	} else {
-		t[txTpl] = createTemplate("./static/templates/tx.html", "./static/templates/txdetail.html", "./static/templates/base.html")
-		t[addressTpl] = createTemplate("./static/templates/address.html", "./static/templates/txdetail.html", "./static/templates/paging.html", "./static/templates/base.html")
-		t[blockTpl] = createTemplate("./static/templates/block.html", "./static/templates/txdetail.html", "./static/templates/paging.html", "./static/templates/base.html")
+		t[txTpl] = createTemplate(txTemplate, txDetailTemplate, "./static/templates/base.html")
+		t[addressTpl] = createTemplate("./static/templates/address.html", resolvedAddressChainExtraTemplate, txDetailTemplate, "./static/templates/paging.html", "./static/templates/base.html")
+		t[blockTpl] = createTemplate("./static/templates/block.html", txDetailTemplate, "./static/templates/paging.html", "./static/templates/base.html")
 	}
 	t[xpubTpl] = createTemplate("./static/templates/xpub.html", "./static/templates/txdetail.html", "./static/templates/paging.html", "./static/templates/base.html")
 	t[mempoolTpl] = createTemplate("./static/templates/mempool.html", "./static/templates/paging.html", "./static/templates/base.html")
@@ -748,12 +806,12 @@ func addressAliasSpan(a string, td *TemplateData) template.HTML {
 	alias := getAddressAlias(a, td)
 	if alias == nil {
 		rv.WriteString(`<span class="copyable">`)
-		rv.WriteString(a)
+		rv.WriteString(html.EscapeString(a))
 	} else {
 		rv.WriteString(`<span class="copyable" cc="`)
 		rv.WriteString(html.EscapeString(a))
 		rv.WriteString(`" alias-type="`)
-		rv.WriteString(alias.Type)
+		rv.WriteString(html.EscapeString(alias.Type))
 		rv.WriteString(`">`)
 		rv.WriteString(html.EscapeString(alias.Alias))
 	}
@@ -853,24 +911,42 @@ func (s *PublicServer) explorerSpendingTx(w http.ResponseWriter, r *http.Request
 	return errorTpl, nil, err
 }
 
+// validateIntParam validates and sanitizes integer parameters from query strings
+func validateIntParam(value string, defaultValue int, min int, max int) int {
+	if value == "" {
+		return defaultValue
+	}
+	val, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	if val < min {
+		return defaultValue
+	}
+	if max > 0 && val > max {
+		return max
+	}
+	return val
+}
+
 func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api.AccountDetails, maxPageSize int) (int, int, api.AccountDetails, *api.AddressFilter, string, int) {
 	var voutFilter = api.AddressFilterVoutOff
-	page, ec := strconv.Atoi(r.URL.Query().Get("page"))
-	if ec != nil {
-		page = 0
-	}
-	pageSize, ec := strconv.Atoi(r.URL.Query().Get("pageSize"))
-	if ec != nil || pageSize > maxPageSize {
+	page := validateIntParam(r.URL.Query().Get("page"), 0, 0, maxPageNumber)
+	pageSize := validateIntParam(r.URL.Query().Get("pageSize"), maxPageSize, 0, maxPageSize)
+	if pageSize == 0 {
 		pageSize = maxPageSize
 	}
-	from, ec := strconv.Atoi(r.URL.Query().Get("from"))
-	if ec != nil {
-		from = 0
+	from := validateIntParam(r.URL.Query().Get("from"), 0, 0, 10000000000)
+	to := validateIntParam(r.URL.Query().Get("to"), 0, 0, 10000000000)
+
+	// Check for overflow in page * pageSize calculation
+	const maxSafeOffset = 1000000000
+	if page > 0 && pageSize > 0 {
+		if page > maxSafeOffset/pageSize {
+			page = maxSafeOffset / pageSize
+		}
 	}
-	to, ec := strconv.Atoi(r.URL.Query().Get("to"))
-	if ec != nil {
-		to = 0
-	}
+
 	filterParam := r.URL.Query().Get("filter")
 	if len(filterParam) > 0 {
 		if filterParam == "inputs" {
@@ -878,7 +954,7 @@ func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api
 		} else if filterParam == "outputs" {
 			voutFilter = api.AddressFilterVoutOutputs
 		} else {
-			voutFilter, ec = strconv.Atoi(filterParam)
+			voutFilter, ec := strconv.Atoi(filterParam)
 			if ec != nil || voutFilter < 0 {
 				voutFilter = api.AddressFilterVoutOff
 			}
@@ -907,17 +983,17 @@ func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api
 	case "nonzero":
 		tokensToReturn = api.TokensToReturnNonzeroBalance
 	}
-	gap, ec := strconv.Atoi(r.URL.Query().Get("gap"))
-	if ec != nil {
-		gap = 0
-	}
+	// Validate gap: non-negative, reasonable max (gap limit typically small, maxGapValue)
+	gap := validateIntParam(r.URL.Query().Get("gap"), 0, 0, maxGapValue)
 	contract := r.URL.Query().Get("contract")
+	includeErc4626, _ := strconv.ParseBool(r.URL.Query().Get("includeErc4626"))
 	return page, pageSize, accountDetails, &api.AddressFilter{
 		Vout:           voutFilter,
 		TokensToReturn: tokensToReturn,
 		FromHeight:     uint32(from),
 		ToHeight:       uint32(to),
 		Contract:       contract,
+		IncludeErc4626: includeErc4626,
 	}, filterParam, gap
 }
 
@@ -1010,10 +1086,7 @@ func (s *PublicServer) explorerBlocks(w http.ResponseWriter, r *http.Request) (t
 	var blocks *api.Blocks
 	var err error
 	s.metrics.ExplorerViews.With(common.Labels{"action": "blocks"}).Inc()
-	page, ec := strconv.Atoi(r.URL.Query().Get("page"))
-	if ec != nil {
-		page = 0
-	}
+	page := validateIntParam(r.URL.Query().Get("page"), 0, 0, maxPageNumber)
 	blocks, err = s.api.GetBlocks(page, blocksOnPage)
 	if err != nil {
 		return errorTpl, nil, err
@@ -1030,10 +1103,7 @@ func (s *PublicServer) explorerBlock(w http.ResponseWriter, r *http.Request) (tp
 	var err error
 	s.metrics.ExplorerViews.With(common.Labels{"action": "block"}).Inc()
 	if i := strings.LastIndexByte(r.URL.Path, '/'); i > 0 {
-		page, ec := strconv.Atoi(r.URL.Query().Get("page"))
-		if ec != nil {
-			page = 0
-		}
+		page := validateIntParam(r.URL.Query().Get("page"), 0, 0, maxPageNumber)
 		block, err = s.api.GetBlock(r.URL.Path[i+1:], page, txsOnPage)
 		if err != nil {
 			return errorTpl, nil, err
@@ -1072,6 +1142,23 @@ func (s *PublicServer) explorerSearch(w http.ResponseWriter, r *http.Request) (t
 	var err error
 	s.metrics.ExplorerViews.With(common.Labels{"action": "search"}).Inc()
 	if len(q) > 0 {
+		// Check if this is an ENS name for Ethereum chains and check if it is not expired and unique
+		if s.chainParser.GetChainType() == bchain.ChainEthereumType &&
+			strings.HasSuffix(strings.ToLower(q), ".eth") {
+			if ensResolver, ok := s.chain.(interface {
+				ResolveENS(string) (*bchain.ENSResolution, error)
+				CheckENSExpiration(string) (bool, error)
+			}); ok {
+				expired, err := ensResolver.CheckENSExpiration(q)
+				if err == nil && !expired {
+					ensRes, err := ensResolver.ResolveENS(q)
+					if err == nil && ensRes.Address != "" {
+						http.Redirect(w, r, joinURL("/address/", ensRes.Address), http.StatusFound)
+						return noTpl, nil, nil
+					}
+				}
+			}
+		}
 		address, err = s.api.GetXpubAddress(q, 0, 1, api.AccountDetailsBasic, &api.AddressFilter{Vout: api.AddressFilterVoutOff}, 0, "")
 		if err == nil {
 			http.Redirect(w, r, joinURL("/xpub/", url.QueryEscape(address.AddrStr)), http.StatusFound)
@@ -1122,10 +1209,7 @@ func (s *PublicServer) explorerMempool(w http.ResponseWriter, r *http.Request) (
 	var mempoolTxids *api.MempoolTxids
 	var err error
 	s.metrics.ExplorerViews.With(common.Labels{"action": "mempool"}).Inc()
-	page, ec := strconv.Atoi(r.URL.Query().Get("page"))
-	if ec != nil {
-		page = 0
-	}
+	page := validateIntParam(r.URL.Query().Get("page"), 0, 0, maxPageNumber)
 	mempoolTxids, err = s.api.GetMempool(page, mempoolTxsOnPage)
 	if err != nil {
 		return errorTpl, nil, err
@@ -1265,19 +1349,9 @@ func (s *PublicServer) apiBlockFilters(r *http.Request, apiVersion int) (interfa
 		BlockFilters map[int]blockFilterResult `json:"blockFilters"`
 	}
 
-	// Parse parameters
-	lastN, ec := strconv.Atoi(r.URL.Query().Get("lastN"))
-	if ec != nil {
-		lastN = 0
-	}
-	from, ec := strconv.Atoi(r.URL.Query().Get("from"))
-	if ec != nil {
-		from = 0
-	}
-	to, ec := strconv.Atoi(r.URL.Query().Get("to"))
-	if ec != nil {
-		to = 0
-	}
+	lastN := validateIntParam(r.URL.Query().Get("lastN"), 0, 0, 10000)
+	from := validateIntParam(r.URL.Query().Get("from"), 0, 0, 10000000000)
+	to := validateIntParam(r.URL.Query().Get("to"), 0, 0, 10000000000)
 	scriptType := r.URL.Query().Get("scriptType")
 	if scriptType != s.is.BlockFilterScripts {
 		return nil, api.NewAPIError(fmt.Sprintf("Invalid scriptType %s. Use %s", scriptType, s.is.BlockFilterScripts), true)
@@ -1459,10 +1533,7 @@ func (s *PublicServer) apiUtxo(r *http.Request, apiVersion int) (interface{}, er
 				return nil, api.NewAPIError("Parameter 'confirmed' cannot be converted to boolean", true)
 			}
 		}
-		gap, ec := strconv.Atoi(r.URL.Query().Get("gap"))
-		if ec != nil {
-			gap = 0
-		}
+		gap := validateIntParam(r.URL.Query().Get("gap"), 0, 0, maxGapValue)
 		utxo, err = s.api.GetXpubUtxo(desc, onlyConfirmed, gap)
 		if err == nil {
 			s.metrics.ExplorerViews.With(common.Labels{"action": "api-xpub-utxo"}).Inc()
@@ -1482,10 +1553,7 @@ func (s *PublicServer) apiBalanceHistory(r *http.Request, apiVersion int) (inter
 	var fromTimestamp, toTimestamp int64
 	var err error
 	if i := strings.LastIndexByte(r.URL.Path, '/'); i > 0 {
-		gap, ec := strconv.Atoi(r.URL.Query().Get("gap"))
-		if ec != nil {
-			gap = 0
-		}
+		gap := validateIntParam(r.URL.Query().Get("gap"), 0, 0, maxGapValue)
 		from := r.URL.Query().Get("from")
 		if from != "" {
 			fromTimestamp, err = strconv.ParseInt(from, 10, 64)
@@ -1526,10 +1594,7 @@ func (s *PublicServer) apiBlock(r *http.Request, apiVersion int) (interface{}, e
 	var err error
 	s.metrics.ExplorerViews.With(common.Labels{"action": "api-block"}).Inc()
 	if i := strings.LastIndexByte(r.URL.Path, '/'); i > 0 {
-		page, ec := strconv.Atoi(r.URL.Query().Get("page"))
-		if ec != nil {
-			page = 0
-		}
+		page := validateIntParam(r.URL.Query().Get("page"), 0, 0, maxPageNumber)
 		block, err = s.api.GetBlock(r.URL.Path[i+1:], page, txsInAPI)
 		if err == nil && apiVersion == apiV1 {
 			return s.api.BlockToV1(block), nil
@@ -1562,17 +1627,31 @@ type resultSendTransaction struct {
 	Result string `json:"result"`
 }
 
+func readSendTxHexFromBody(body io.Reader, maxBodyBytes int64) (string, error) {
+	var hex strings.Builder
+	n, err := io.Copy(&hex, io.LimitReader(body, maxBodyBytes+1))
+	if err != nil {
+		return "", api.NewAPIError("Missing tx blob", true)
+	}
+	if n > maxBodyBytes {
+		return "", api.NewAPIError("Tx blob too large", true)
+	}
+	return hex.String(), nil
+}
+
 func (s *PublicServer) apiSendTx(r *http.Request, apiVersion int) (interface{}, error) {
 	var err error
 	var res resultSendTransaction
 	var hex string
 	s.metrics.ExplorerViews.With(common.Labels{"action": "api-sendtx"}).Inc()
 	if r.Method == http.MethodPost {
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			return nil, api.NewAPIError("Missing tx blob", true)
+		if r.ContentLength > maxSendTxBodyBytes {
+			return nil, api.NewAPIError("Tx blob too large", true)
 		}
-		hex = string(data)
+		hex, err = readSendTxHexFromBody(r.Body, maxSendTxBodyBytes)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		if i := strings.LastIndexByte(r.URL.Path, '/'); i > 0 {
 			hex = r.URL.Path[i+1:]
@@ -1596,7 +1675,7 @@ func (s *PublicServer) apiAvailableVsCurrencies(r *http.Request, apiVersion int)
 	if err != nil {
 		return nil, api.NewAPIError("Parameter \"timestamp\" is not a valid Unix timestamp.", true)
 	}
-	token := strings.ToLower(r.URL.Query().Get("token"))
+	token := r.URL.Query().Get("token")
 	result, err := s.api.GetAvailableVsCurrencies(timestamp, token)
 	return result, err
 }
@@ -1611,7 +1690,7 @@ func (s *PublicServer) apiTickers(r *http.Request, apiVersion int) (interface{},
 	if currency != "" {
 		currencies = []string{currency}
 	}
-	token := strings.ToLower(r.URL.Query().Get("token"))
+	token := r.URL.Query().Get("token")
 
 	if block := r.URL.Query().Get("block"); block != "" {
 		// Get tickers for specified block height or block hash
@@ -1652,7 +1731,7 @@ func (s *PublicServer) apiMultiTickers(r *http.Request, apiVersion int) (interfa
 	if currency != "" {
 		currencies = []string{currency}
 	}
-	token := strings.ToLower(r.URL.Query().Get("token"))
+	token := r.URL.Query().Get("token")
 	if timestampString := r.URL.Query().Get("timestamp"); timestampString != "" {
 		// Get tickers for specified timestamp
 		s.metrics.ExplorerViews.With(common.Labels{"action": "api-multi-tickers-date"}).Inc()
