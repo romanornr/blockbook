@@ -277,6 +277,33 @@ func TestBlockbookServiceTemplateGatesWantsLine(t *testing.T) {
 	}
 }
 
+func TestJunocashBackendUsesV0910Release(t *testing.T) {
+	configsDir := filepath.Clean(filepath.Join("..", "..", "configs"))
+	const wantURL = "https://github.com/juno-cash/junocash/releases/download/v0.9.10/junocash-0.9.10-linux64.tar.gz"
+	const wantSHA256 = "c999f471e88375f0cd57acbb904a71c79334bc341e9ac5a7f275aca5a856d84d"
+
+	for _, coin := range []string{"junocash", "junocash_testnet"} {
+		t.Run(coin, func(t *testing.T) {
+			config, err := LoadConfig(configsDir, coin)
+			if err != nil {
+				t.Fatalf("LoadConfig() error = %v", err)
+			}
+			if config.Backend.Version != "0.9.10" {
+				t.Fatalf("backend version = %q, want %q", config.Backend.Version, "0.9.10")
+			}
+			if config.Backend.BinaryURL != wantURL {
+				t.Fatalf("backend binary_url = %q, want %q", config.Backend.BinaryURL, wantURL)
+			}
+			if config.Backend.VerificationType != "sha256" {
+				t.Fatalf("backend verification_type = %q, want %q", config.Backend.VerificationType, "sha256")
+			}
+			if config.Backend.VerificationSource != wantSHA256 {
+				t.Fatalf("backend verification_source = %q, want %q", config.Backend.VerificationSource, wantSHA256)
+			}
+		})
+	}
+}
+
 func TestJunocashBlockchainCfgEnablesCoingeckoFiatRates(t *testing.T) {
 	configsDir := filepath.Clean(filepath.Join("..", "..", "configs"))
 
