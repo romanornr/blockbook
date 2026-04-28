@@ -962,8 +962,7 @@ func (d *RocksDB) storeInternalDataEthereumType(wb *grocksdb.WriteBatch, blockTx
 	return nil
 }
 
-var cachedContracts = make(map[string]*bchain.ContractInfo)
-var cachedContractsMux sync.Mutex
+var cachedContracts = newContractInfoLRU(cachedContractsLRUMaxSize)
 
 func packContractInfo(contractInfo *bchain.ContractInfo) []byte {
 	buf := packString(contractInfo.Name)
@@ -1015,9 +1014,7 @@ func (d *RocksDB) GetContractInfoForAddress(address string) (*bchain.ContractInf
 // it is hard to guess the standard of the contract using API, it is easier to set it the first time the contract is processed in a tx
 func (d *RocksDB) GetContractInfo(contract bchain.AddressDescriptor, standardFromContext bchain.TokenStandardName) (*bchain.ContractInfo, error) {
 	cacheKey := string(contract)
-	cachedContractsMux.Lock()
-	contractInfo, found := cachedContracts[cacheKey]
-	cachedContractsMux.Unlock()
+	contractInfo, found := cachedContracts.get(cacheKey)
 	if !found {
 		val, err := d.db.GetCF(d.ro, d.cfh[cfContracts], contract)
 		if err != nil {
@@ -1042,9 +1039,7 @@ func (d *RocksDB) GetContractInfo(contract bchain.AddressDescriptor, standardFro
 				return nil, err
 			}
 		}
-		cachedContractsMux.Lock()
-		cachedContracts[cacheKey] = contractInfo
-		cachedContractsMux.Unlock()
+		cachedContracts.add(cacheKey, contractInfo)
 	}
 	return contractInfo, nil
 }
@@ -1080,9 +1075,7 @@ func (d *RocksDB) storeContractInfo(wb *grocksdb.WriteBatch, contractInfo *bchai
 		}
 		wb.PutCF(d.cfh[cfContracts], key, packContractInfo(contractInfo))
 		cacheKey := string(key)
-		cachedContractsMux.Lock()
-		delete(cachedContracts, cacheKey)
-		cachedContractsMux.Unlock()
+		cachedContracts.delete(cacheKey)
 	}
 	return nil
 }
@@ -1528,6 +1521,7 @@ func (d *RocksDB) SortAddressContracts(stop chan os.Signal) error {
 	glog.Info("SortAddressContracts: starting")
 	// do not use cache
 	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
 	ro.SetFillCache(false)
 	it := d.db.NewIteratorCF(ro, d.cfh[cfAddressContracts])
 	defer it.Close()
@@ -1636,6 +1630,19 @@ func (acs *unpackedAddrContracts) rebuildContractIndex() {
 	}
 	acs.contractIndex = m
 	acs.contractIndexDirty = false
+}
+
+func (acs *unpackedAddrContracts) dropContractIndex() {
+	acs.contractIndex = nil
+	acs.contractIndexDirty = false
+}
+
+func (d *RocksDB) dropAddrContractsContractIndex(addrKey addressHotnessKey) {
+	d.addrContractsCacheMux.Lock()
+	if acs := d.addrContractsCache[string(addrKey[:])]; acs != nil {
+		acs.dropContractIndex()
+	}
+	d.addrContractsCacheMux.Unlock()
 }
 
 func (acs *unpackedAddrContracts) findContractIndex(addrDesc, contract bchain.AddressDescriptor, hot *addressHotness) (int, bool) {
@@ -1985,6 +1992,19 @@ func (d *RocksDB) flushAddrContractsCache() {
 		d.writeContractsCacheSnapshot(cache)
 	}
 	glog.Info("storeAddrContractsCache: store ", count, " entries in ", time.Since(start))
+}
+
+func (d *RocksDB) flushAddrContractsCacheIfOverCap() {
+	maxBytes := d.addrContractsCacheMaxBytes
+	if maxBytes <= 0 {
+		return
+	}
+	d.addrContractsCacheMux.Lock()
+	overCap := d.addrContractsCacheBytes > maxBytes
+	d.addrContractsCacheMux.Unlock()
+	if overCap {
+		d.flushAddrContractsCache()
+	}
 }
 
 func (d *RocksDB) storeAddrContractsCache() {

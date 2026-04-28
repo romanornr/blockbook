@@ -165,6 +165,40 @@ func Test_unpackedAddrContracts_findContractIndex_HotnessTriggers(t *testing.T) 
 	}
 }
 
+func Test_unpackedAddrContracts_findContractIndex_DropsIndexOnHotnessEviction(t *testing.T) {
+	parser := ethereumTestnetParser()
+	parser.HotAddressMinContracts = 1
+	parser.HotAddressLRUCacheSize = 1
+	parser.HotAddressMinHits = 1
+	d := setupRocksDB(t, &testEthereumParser{
+		EthereumParser: parser,
+	})
+	defer closeAndDestroyRocksDB(t, d)
+
+	addr1 := makeTestAddrDesc(1100)
+	addr2 := makeTestAddrDesc(1101)
+	acs1 := &unpackedAddrContracts{Contracts: []unpackedAddrContract{{Contract: makeTestAddrDesc(1200)}}}
+	acs2 := &unpackedAddrContracts{Contracts: []unpackedAddrContract{{Contract: makeTestAddrDesc(1201)}}}
+	d.addrContractsCache[string(addr1)] = acs1
+	d.addrContractsCache[string(addr2)] = acs2
+
+	if _, found := acs1.findContractIndex(addr1, acs1.Contracts[0].Contract, d.hotAddrTracker); !found {
+		t.Fatal("expected first contract to be found")
+	}
+	if acs1.contractIndex == nil {
+		t.Fatal("expected first contract index to be built")
+	}
+	if _, found := acs2.findContractIndex(addr2, acs2.Contracts[0].Contract, d.hotAddrTracker); !found {
+		t.Fatal("expected second contract to be found")
+	}
+	if acs1.contractIndex != nil {
+		t.Fatal("expected first contract index to be dropped after LRU eviction")
+	}
+	if acs2.contractIndex == nil {
+		t.Fatal("expected second contract index to remain hot")
+	}
+}
+
 func Test_addrContractsCache_FlushOnCap(t *testing.T) {
 	d := setupRocksDB(t, &testEthereumParser{
 		EthereumParser: ethereumTestnetParser(),
@@ -755,10 +789,15 @@ func Test_BulkConnect_EthereumType(t *testing.T) {
 		EthereumParser: ethereumTestnetParser(),
 	})
 	defer closeAndDestroyRocksDB(t, d)
+	tipMaxBytes := d.addrContractsCacheMaxBytes
+	bulkMaxBytes := d.bulkAddrContractsCacheMaxBytes
 
 	bc, err := d.InitBulkConnect()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got, want := d.addrContractsCacheMaxBytes, bulkMaxBytes; got != want {
+		t.Fatalf("InitBulkConnect() addrContractsCacheMaxBytes = %d, want %d", got, want)
 	}
 
 	if d.is.DbState != common.DbStateInconsistent {
@@ -788,6 +827,10 @@ func Test_BulkConnect_EthereumType(t *testing.T) {
 	if err := bc.Close(); err != nil {
 		t.Fatal(err)
 	}
+	assertBulkConnectReleased(t, bc)
+	if got := d.addrContractsCacheMaxBytes; got != tipMaxBytes {
+		t.Fatalf("Close() addrContractsCacheMaxBytes = %d, want %d", got, tipMaxBytes)
+	}
 
 	if d.is.DbState != common.DbStateOpen {
 		t.Fatal("DB not in DbStateOpen")
@@ -797,6 +840,81 @@ func Test_BulkConnect_EthereumType(t *testing.T) {
 
 	if len(d.is.BlockTimes) != 4321002 {
 		t.Fatal("Expecting is.BlockTimes 4321002, got ", len(d.is.BlockTimes))
+	}
+}
+
+func Test_BulkConnect_EthereumType_UsesConfiguredAddrContractsCacheMaxBytes(t *testing.T) {
+	parser := ethereumTestnetParser()
+	parser.AddrContractsCacheMaxBytes = 10
+	parser.AddrContractsCacheBulkMaxBytes = 20
+	d := setupRocksDB(t, &testEthereumParser{
+		EthereumParser: parser,
+	})
+	defer closeAndDestroyRocksDB(t, d)
+	tipMaxBytes := d.tipAddrContractsCacheMaxBytes
+	bulkMaxBytes := d.bulkAddrContractsCacheMaxBytes
+
+	bc1, err := d.InitBulkConnect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.addrContractsCacheMaxBytes; got != bulkMaxBytes {
+		t.Fatalf("first InitBulkConnect() addrContractsCacheMaxBytes = %d, want %d", got, bulkMaxBytes)
+	}
+
+	bc2, err := d.InitBulkConnect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.addrContractsCacheMaxBytes; got != bulkMaxBytes {
+		t.Fatalf("second InitBulkConnect() addrContractsCacheMaxBytes = %d, want %d", got, bulkMaxBytes)
+	}
+
+	if err := bc2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.addrContractsCacheMaxBytes; got != tipMaxBytes {
+		t.Fatalf("second Close() addrContractsCacheMaxBytes = %d, want %d", got, tipMaxBytes)
+	}
+
+	if err := bc1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.addrContractsCacheMaxBytes; got != tipMaxBytes {
+		t.Fatalf("first Close() addrContractsCacheMaxBytes = %d, want %d", got, tipMaxBytes)
+	}
+}
+
+func Test_BulkConnect_EthereumType_CloseFlushesAddrContractsCacheOverTipCap(t *testing.T) {
+	parser := ethereumTestnetParser()
+	parser.AddrContractsCacheMaxBytes = 10
+	parser.AddrContractsCacheBulkMaxBytes = 20
+	d := setupRocksDB(t, &testEthereumParser{
+		EthereumParser: parser,
+	})
+	defer closeAndDestroyRocksDB(t, d)
+
+	bc, err := d.InitBulkConnect()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.addrContractsCacheMux.Lock()
+	d.addrContractsCache[string(makeTestAddrDesc(99))] = &unpackedAddrContracts{TotalTxs: 1}
+	d.addrContractsCacheBytes = d.tipAddrContractsCacheMaxBytes + 1
+	d.addrContractsCacheMux.Unlock()
+
+	if err := bc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.addrContractsCacheMaxBytes; got != d.tipAddrContractsCacheMaxBytes {
+		t.Fatalf("Close() addrContractsCacheMaxBytes = %d, want %d", got, d.tipAddrContractsCacheMaxBytes)
+	}
+	if got := len(d.addrContractsCache); got != 0 {
+		t.Fatalf("Close() addrContractsCache entries = %d, want 0", got)
+	}
+	if got := d.addrContractsCacheBytes; got != 0 {
+		t.Fatalf("Close() addrContractsCacheBytes = %d, want 0", got)
 	}
 }
 

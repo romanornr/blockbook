@@ -1305,9 +1305,7 @@ func (w *Worker) getEthereumTypeAddressBalances(addrDesc bchain.AddressDescripto
 			}
 			d.tokens = d.tokens[:j]
 			sort.Sort(d.tokens)
-			if filter.IncludeErc4626 {
-				w.enrichErc4626Tokens(d.tokens)
-			}
+			w.enrichTokenProtocols(d.tokens, filter.Protocols)
 		}
 		d.contractInfo, err = w.db.GetContractInfo(addrDesc, bchain.UnknownTokenStandard)
 		if err != nil {
@@ -1663,6 +1661,14 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 		}
 	}
 	uBalSat.Sub(&uBalReceiving, &uBalSending)
+	var contractInfoBestHeight uint32
+	if ed.contractInfo != nil {
+		h, _, err := w.db.GetBestBlock()
+		if err != nil {
+			return nil, errors.Annotatef(err, "GetBestBlock")
+		}
+		contractInfoBestHeight = h
+	}
 	r := &Address{
 		Paging:                pg,
 		AddrStr:               address,
@@ -1684,7 +1690,7 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 		TokensSecondaryValue:  ed.tokensSecondaryValue,
 		TotalBaseValue:        totalBaseValue,
 		TotalSecondaryValue:   totalSecondaryValue,
-		ContractInfo:          ed.contractInfo,
+		ContractInfo:          contractInfoResultFromBchain(ed.contractInfo, contractInfoBestHeight),
 		Nonce:                 ed.nonce,
 		AddressAliases:        w.getAddressAliases(addresses),
 		StakingPools:          ed.stakingPools,
@@ -1692,7 +1698,7 @@ func (w *Worker) GetAddress(address string, page int, txsOnPage int, option Acco
 	}
 	// keep address backward compatible, set deprecated Erc20Contract value if ERC20 token
 	if ed.contractInfo != nil && ed.contractInfo.Standard == bchain.ERC20TokenStandard {
-		r.Erc20Contract = ed.contractInfo
+		r.Erc20Contract = r.ContractInfo
 	}
 	glog.Info("GetAddress-", option, " ", address, ", ", time.Since(start))
 	return r, nil

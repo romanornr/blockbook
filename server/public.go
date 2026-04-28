@@ -34,8 +34,10 @@ const txsOnPage = 25
 const blocksOnPage = 50
 const mempoolTxsOnPage = 50
 const txsInAPI = 1000
+const maxWebsocketBlockPageSize = 10000
 const maxPageNumber = 1000000
 const maxGapValue = 10000
+const maxSafePagingOffset = 1000000000
 const maxSendTxBodyBytes int64 = 8 * 1024 * 1024
 
 const secondaryCoinCookieName = "secondary_coin"
@@ -258,6 +260,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/tx/", s.jsonHandler(s.apiTx, apiDefault))
 	serveMux.HandleFunc(path+"api/rawtx/", s.jsonHandler(s.apiRawTx, apiDefault))
 	serveMux.HandleFunc(path+"api/address/", s.jsonHandler(s.apiAddress, apiDefault))
+	serveMux.HandleFunc(path+"api/contract/", s.jsonHandler(s.apiContract, apiDefault))
 	serveMux.HandleFunc(path+"api/xpub/", s.jsonHandler(s.apiXpub, apiDefault))
 	serveMux.HandleFunc(path+"api/utxo/", s.jsonHandler(s.apiUtxo, apiDefault))
 	serveMux.HandleFunc(path+"api/block/", s.jsonHandler(s.apiBlock, apiDefault))
@@ -272,6 +275,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/v2/tx-specific/", s.jsonHandler(s.apiTxSpecific, apiV2))
 	serveMux.HandleFunc(path+"api/v2/tx/", s.jsonHandler(s.apiTx, apiV2))
 	serveMux.HandleFunc(path+"api/v2/address/", s.jsonHandler(s.apiAddress, apiV2))
+	serveMux.HandleFunc(path+"api/v2/contract/", s.jsonHandler(s.apiContract, apiV2))
 	serveMux.HandleFunc(path+"api/v2/xpub/", s.jsonHandler(s.apiXpub, apiV2))
 	serveMux.HandleFunc(path+"api/v2/utxo/", s.jsonHandler(s.apiUtxo, apiV2))
 	serveMux.HandleFunc(path+"api/v2/block/", s.jsonHandler(s.apiBlock, apiV2))
@@ -921,15 +925,7 @@ func (s *PublicServer) explorerSpendingTx(w http.ResponseWriter, r *http.Request
 	return errorTpl, nil, err
 }
 
-// validateIntParam validates and sanitizes integer parameters from query strings
-func validateIntParam(value string, defaultValue int, min int, max int) int {
-	if value == "" {
-		return defaultValue
-	}
-	val, err := strconv.Atoi(value)
-	if err != nil {
-		return defaultValue
-	}
+func validateIntValue(val, defaultValue int, min int, max int) int {
 	if val < min {
 		return defaultValue
 	}
@@ -939,23 +935,53 @@ func validateIntParam(value string, defaultValue int, min int, max int) int {
 	return val
 }
 
+func parseProtocolsQuery(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	protocols := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, protocol := range strings.Split(value, ",") {
+			protocol = strings.TrimSpace(protocol)
+			if protocol != "" {
+				protocols = append(protocols, protocol)
+			}
+		}
+	}
+	return protocols
+}
+
+// validateIntParam validates and sanitizes integer parameters from query strings
+func validateIntParam(value string, defaultValue int, min int, max int) int {
+	if value == "" {
+		return defaultValue
+	}
+	val, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	return validateIntValue(val, defaultValue, min, max)
+}
+
+func sanitizePagingParams(page, pageSize, defaultPageSize, maxPageSize int) (int, int) {
+	page = validateIntValue(page, 0, 0, maxPageNumber)
+	pageSize = validateIntValue(pageSize, defaultPageSize, 0, maxPageSize)
+	if pageSize == 0 {
+		pageSize = defaultPageSize
+	}
+	if page > 0 && pageSize > 0 && page > maxSafePagingOffset/pageSize {
+		page = maxSafePagingOffset / pageSize
+	}
+	return page, pageSize
+}
+
 func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api.AccountDetails, maxPageSize int) (int, int, api.AccountDetails, *api.AddressFilter, string, int) {
 	var voutFilter = api.AddressFilterVoutOff
 	page := validateIntParam(r.URL.Query().Get("page"), 0, 0, maxPageNumber)
 	pageSize := validateIntParam(r.URL.Query().Get("pageSize"), maxPageSize, 0, maxPageSize)
-	if pageSize == 0 {
-		pageSize = maxPageSize
-	}
+	page, pageSize = sanitizePagingParams(page, pageSize, maxPageSize, maxPageSize)
 	from := validateIntParam(r.URL.Query().Get("from"), 0, 0, 10000000000)
 	to := validateIntParam(r.URL.Query().Get("to"), 0, 0, 10000000000)
-
-	// Check for overflow in page * pageSize calculation
-	const maxSafeOffset = 1000000000
-	if page > 0 && pageSize > 0 {
-		if page > maxSafeOffset/pageSize {
-			page = maxSafeOffset / pageSize
-		}
-	}
 
 	filterParam := r.URL.Query().Get("filter")
 	if len(filterParam) > 0 {
@@ -996,14 +1022,13 @@ func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api
 	// Validate gap: non-negative, reasonable max (gap limit typically small, maxGapValue)
 	gap := validateIntParam(r.URL.Query().Get("gap"), 0, 0, maxGapValue)
 	contract := r.URL.Query().Get("contract")
-	includeErc4626, _ := strconv.ParseBool(r.URL.Query().Get("includeErc4626"))
 	return page, pageSize, accountDetails, &api.AddressFilter{
 		Vout:           voutFilter,
 		TokensToReturn: tokensToReturn,
 		FromHeight:     uint32(from),
 		ToHeight:       uint32(to),
 		Contract:       contract,
-		IncludeErc4626: includeErc4626,
+		Protocols:      parseProtocolsQuery(r.URL.Query()["protocols"]),
 	}, filterParam, gap
 }
 
@@ -1523,12 +1548,28 @@ func (s *PublicServer) apiAddress(r *http.Request, apiVersion int) (interface{},
 	var err error
 	s.metrics.ExplorerViews.With(common.Labels{"action": "api-address"}).Inc()
 	page, pageSize, details, filter, _, _ := s.getAddressQueryParams(r, api.AccountDetailsTxidHistory, txsInAPI)
+	if err := s.api.ValidateProtocolsForChain(filter.Protocols); err != nil {
+		return nil, err
+	}
 	secondaryCoin := strings.ToLower(r.URL.Query().Get("secondary"))
 	address, err = s.api.GetAddress(addressParam, page, pageSize, details, filter, secondaryCoin)
 	if err == nil && apiVersion == apiV1 {
 		return s.api.AddressToV1(address), nil
 	}
 	return address, err
+}
+
+func (s *PublicServer) apiContract(r *http.Request, apiVersion int) (interface{}, error) {
+	var contract string
+	i := strings.LastIndex(r.URL.Path, "contract/")
+	if i > 0 {
+		contract = r.URL.Path[i+9:]
+	}
+	if len(contract) == 0 {
+		return nil, api.NewAPIError("Missing contract", true)
+	}
+	s.metrics.ExplorerViews.With(common.Labels{"action": "api-contract"}).Inc()
+	return s.api.GetContractInfoData(contract, strings.ToLower(r.URL.Query().Get("currency")), parseProtocolsQuery(r.URL.Query()["protocols"]))
 }
 
 func (s *PublicServer) apiXpub(r *http.Request, apiVersion int) (interface{}, error) {

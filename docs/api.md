@@ -486,7 +486,7 @@ Example response:
 Returns balances and transactions of an address. The returned transactions are sorted by block height, newest blocks first.
 
 ```
-GET /api/v2/address/<address>[?page=<page>&pageSize=<size>&from=<block height>&to=<block height>&details=<basic|tokens|tokenBalances|txids|txs>&contract=<contract address>&secondary=usd]
+GET /api/v2/address/<address>[?page=<page>&pageSize=<size>&from=<block height>&to=<block height>&details=<basic|tokens|tokenBalances|txids|txs>&contract=<contract address>&protocols=<protocol1,protocol2,...>&secondary=usd]
 ```
 
 The optional query parameters:
@@ -502,6 +502,7 @@ The optional query parameters:
     -   _txslight_: _tokenBalances_ + list of transaction with limited details (only data from index), subject to _from_, _to_ filter and paging
     -   _txs_: _tokenBalances_ + list of transaction with details, subject to _from_, _to_ filter and paging
 -   _contract_: return only transactions which affect specified contract (applicable only to coins which support contracts)
+-   _protocols_: optional comma-separated list of protocol enrichments to include. Currently supported value: `erc4626`. Unknown values are rejected with an error. In account responses, protocol payloads are returned under `tokens[].protocols`.
 -   _secondary_: specifies secondary (fiat) currency in which the token and total balances are returned in addition to crypto values
 
 Example response for bitcoin type coin, _details_ set to _txids_ (`Address` type):
@@ -560,6 +561,62 @@ Example response for ethereum type coin, _details_ set to _tokenBalances_ and _s
   "totalSecondaryValue": 4947.462160741995
 }
 
+```
+
+#### Get contract info
+
+Returns metadata for a single contract together with optional enrichments requested by the caller.
+
+This endpoint exists in part because `erc4626` data returned from `getAccountInfo` or `/api/v2/address` is only a snapshot taken when that broader account response was fetched. Suite can fetch current contract-level metadata for the token the user is actively interacting with without reloading full account data.
+
+```
+GET /api/v2/contract/<contract>[?currency=<currency>&protocols=<protocol1,protocol2,...>]
+```
+
+Parameters:
+
+-   _currency_: optional secondary currency code (for example `usd`). When present, the response may include `rates.secondaryRate` in that currency.
+-   _protocols_: optional comma-separated list of protocol enrichments to include. Currently supported value: `erc4626`. Unknown values are rejected with an error.
+
+`blockHeight` reflects the indexer's best block at request time. ERC-4626 fields inside `protocols.erc4626` are fetched via live JSON-RPC `eth_call` against the backend node, which may already be one or more blocks ahead of the indexer. Treat `blockHeight` as a floor, not an exact pin.
+
+Response (`ContractInfoResult` type):
+
+```javascript
+{
+  "contract": "0x...",
+  "standard": "ERC20",
+  "name": "Vault Share",
+  "symbol": "vETH",
+  "decimals": 18,
+  "rates": {
+    "baseRate": 0.000523,
+    "currency": "usd",
+    "secondaryRate": 1.24
+  },
+  "protocols": {
+    "erc4626": {
+      "asset": {
+        "contract": "0x...",
+        "name": "Wrapped Ether",
+        "symbol": "WETH",
+        "decimals": 18
+      },
+      "share": {
+        "contract": "0x...",
+        "name": "Vault Share",
+        "symbol": "vETH",
+        "decimals": 18
+      },
+      "totalAssets": "123456789",
+      "convertToAssets1Share": "1000000000000000000",
+      "convertToShares1Asset": "1000000000000000000",
+      "previewDeposit1Asset": "999999999999999999",
+      "previewRedeem1Share": "1000000000000000000"
+    }
+  },
+  "blockHeight": 12345678
+}
 ```
 
 #### Get xpub
@@ -1013,7 +1070,9 @@ The websocket interface provides the following requests:
 
 -   getInfo
 -   getBlockHash
+-   getBlock
 -   getAccountInfo
+-   getContractInfo
 -   getAccountUtxo
 -   getTransaction
 -   getTransactionSpecific
@@ -1074,6 +1133,41 @@ Example for subscribing to an address (or multiple addresses) including new bloc
    }
 }
 ```
+
+Example for getting current contract info including ERC4626 enrichment
+
+```javascript
+{
+  "id":"1",
+  "method":"getContractInfo",
+  "params":{
+    "contract":"0x...",
+    "currency":"usd",
+    "protocols":["erc4626"]
+   }
+}
+```
+
+Example for getting a block with paged transactions
+
+```javascript
+{
+  "id":"1",
+  "method":"getBlock",
+  "params":{
+    "id":"760f8ed32894ccce9c1ea11c8a019cadaa82bcb434b25c30102dd7e43f326217",
+    "page":1,
+    "pageSize":1000
+  }
+}
+```
+
+Notes for `getBlock`:
+
+-   available only when Blockbook runs with extended index enabled
+-   response format matches REST `GET /api/v2/block/<block height|block hash>`
+-   _pageSize_ defaults to `1000` and is capped at `10000`
+-   _page_ is sanitized to stay within safe internal limits
 
 ## Legacy API V1
 
