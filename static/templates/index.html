@@ -38,6 +38,12 @@
                     <td>Last Block</td>
                     <td>{{if .InternalExplorer}}<a href="/block/{{$bb.BestHeight}}">{{formatUint32 $bb.BestHeight}}</a>{{else}}{{formatUint32 $bb.BestHeight}}{{end}}</td>
                 </tr>
+                {{if and (eq $bb.Coin "Junocash") $be.TotalCoins}}
+                <tr>
+                    <td>Total Supply</td>
+                    <td>{{$be.TotalCoins}} {{$cs}}</td>
+                </tr>
+                {{end}}
                 <tr>
                     <td>Last Block Update</td>
                     <td>{{timeSpan $bb.LastBlockTime}}</td>

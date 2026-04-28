@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang/glog"
@@ -38,6 +39,7 @@ const maxGapValue = 10000
 const maxSendTxBodyBytes int64 = 8 * 1024 * 1024
 
 const secondaryCoinCookieName = "secondary_coin"
+const totalCoinsCacheTTL = 60 * time.Second
 const templatesDir = "./static/templates"
 const (
 	txBitcoinTypeTemplate         = templatesDir + "/tx_bitcointype.html"
@@ -55,6 +57,13 @@ const (
 	apiV1
 	apiV2
 )
+
+type totalCoinsCache struct {
+	lock      sync.Mutex
+	value     string
+	height    uint32
+	updatedAt time.Time
+}
 
 // PublicServer provides public http server functionality
 type PublicServer struct {
@@ -76,6 +85,7 @@ type PublicServer struct {
 	fiatRates           *fiat.FiatRates
 	useSatsAmountFormat bool
 	isFullInterface     bool
+	totalCoinsCache     totalCoinsCache
 }
 
 func (s *PublicServer) textHandler(handler func(r *http.Request, apiVersion int) (string, error), apiVersion int) func(w http.ResponseWriter, r *http.Request) {
@@ -1326,14 +1336,39 @@ func (s *PublicServer) apiGetTotalCoins(r *http.Request, apiVersion int) (string
 	if !s.isJunoCashChain() {
 		return "", api.NewAPIError("Endpoint 'gettotalcoins' is only supported for Junocash", true)
 	}
+
+	_, bestHeight, _, _ := s.is.GetSyncState()
+	now := time.Now().UTC()
+
+	s.totalCoinsCache.lock.Lock()
+	defer s.totalCoinsCache.lock.Unlock()
+
+	if s.totalCoinsCache.value != "" && s.totalCoinsCache.height == bestHeight && now.Sub(s.totalCoinsCache.updatedAt) < totalCoinsCacheTTL {
+		return s.totalCoinsCache.value, nil
+	}
+
 	si, err := s.api.GetSystemInfo(false)
 	if err != nil {
+		if s.totalCoinsCache.value != "" {
+			return s.totalCoinsCache.value, nil
+		}
 		return "", err
 	}
 	if si == nil || si.Backend == nil || si.Backend.TotalCoins == "" {
+		if s.totalCoinsCache.value != "" {
+			return s.totalCoinsCache.value, nil
+		}
 		return "", api.NewAPIError("Total coins are unavailable from the Junocash backend", true)
 	}
-	return si.Backend.TotalCoins, nil
+
+	s.totalCoinsCache.value = si.Backend.TotalCoins
+	if si.Backend.Blocks > 0 {
+		s.totalCoinsCache.height = uint32(si.Backend.Blocks)
+	} else {
+		s.totalCoinsCache.height = bestHeight
+	}
+	s.totalCoinsCache.updatedAt = now
+	return s.totalCoinsCache.value, nil
 }
 
 func (s *PublicServer) apiBlockFilters(r *http.Request, apiVersion int) (interface{}, error) {
