@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	stdErrors "errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -25,6 +27,7 @@ import (
 	"github.com/trezor/blockbook/bchain"
 	"github.com/trezor/blockbook/common"
 	"golang.org/x/crypto/sha3"
+	"golang.org/x/sync/singleflight"
 )
 
 // Network type specifies the type of ethereum network
@@ -41,7 +44,21 @@ const (
 	TestNetHoodi Network = 560048
 )
 
-const defaultErc20BatchSize = 100
+const (
+	defaultErc20BatchSize = 100
+
+	// defaultRPCTimeoutSeconds is used when rpc_timeout is unset or non-positive.
+	// A zero b.Timeout makes context.WithTimeout expire immediately (breaking every
+	// call), so a finite floor is enforced rather than trusting the config. Kept
+	// above the 10s trace_timeout default so the fallback still lets a block's
+	// internal-data trace finish.
+	defaultRPCTimeoutSeconds = 15
+
+	// Alternative/private relays expire pending txs quickly, so local pending state
+	// must not inherit the legacy hour-scale public mempool timeout.
+	defaultMempoolTxTimeoutWithAlternativeProvider = 10 * time.Minute
+	defaultAlternativeMempoolTxTimeout             = 5 * time.Minute
+)
 
 // Ethereum address constants
 const (
@@ -78,6 +95,8 @@ type Configuration struct {
 	AddressContractsCacheBulkMaxBytes int64  `json:"address_contracts_cache_bulk_max_bytes,omitempty"`
 	AddressAliases                    bool   `json:"address_aliases,omitempty"`
 	MempoolTxTimeoutHours             int    `json:"mempoolTxTimeoutHours"`
+	MempoolTxTimeout                  string `json:"mempoolTxTimeout,omitempty"`
+	AlternativeMempoolTxTimeout       string `json:"alternativeMempoolTxTimeout,omitempty"`
 	QueryBackendOnMempoolResync       bool   `json:"queryBackendOnMempoolResync"`
 	ProcessInternalTransactions       bool   `json:"processInternalTransactions"`
 	ProcessZeroInternalTransactions   bool   `json:"processZeroInternalTransactions"`
@@ -86,6 +105,62 @@ type Configuration struct {
 	Eip1559Fees                       bool   `json:"eip1559Fees,omitempty"`
 	AlternativeEstimateFee            string `json:"alternative_estimate_fee,omitempty"`
 	AlternativeEstimateFeeParams      string `json:"alternative_estimate_fee_params,omitempty"`
+	// AverageBlockTimeMs is the chain's nominal block cadence in ms;
+	// required for EVM coins (translates duration settings to block counts).
+	AverageBlockTimeMs int `json:"averageBlockTimeMs,omitempty"`
+	// MissingBlockRetry overrides the sync-worker missing-block retry policy
+	// per chain. All fields are optional; missing fields use built-in defaults.
+	MissingBlockRetry *bchain.MissingBlockRetry `json:"missingBlockRetry,omitempty"`
+}
+
+func parseNonNegativeDuration(name string, value string) (time.Duration, error) {
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, errors.Annotatef(err, "invalid %s", name)
+	}
+	if d < 0 {
+		return 0, errors.Errorf("%s must not be negative", name)
+	}
+	return d, nil
+}
+
+func parsePositiveDuration(name string, value string) (time.Duration, error) {
+	d, err := parseNonNegativeDuration(name, value)
+	if err != nil {
+		return 0, err
+	}
+	if d == 0 {
+		return 0, errors.Errorf("%s must be positive", name)
+	}
+	return d, nil
+}
+
+// MempoolTxTimeoutDuration returns the Blockbook-side EVM mempool retention.
+func (c *Configuration) MempoolTxTimeoutDuration(alternativeSendTxProviderEnabled bool) (time.Duration, error) {
+	if c.MempoolTxTimeout != "" {
+		return parseNonNegativeDuration("mempoolTxTimeout", c.MempoolTxTimeout)
+	}
+	// Keep the shorter timeout scoped to alternative/private submission only.
+	if alternativeSendTxProviderEnabled {
+		return defaultMempoolTxTimeoutWithAlternativeProvider, nil
+	}
+	return time.Duration(c.MempoolTxTimeoutHours) * time.Hour, nil
+}
+
+// AlternativeMempoolTxTimeoutDuration returns the alternative-provider cache retention.
+func (c *Configuration) AlternativeMempoolTxTimeoutDuration() (time.Duration, error) {
+	if c.AlternativeMempoolTxTimeout != "" {
+		return parsePositiveDuration("alternativeMempoolTxTimeout", c.AlternativeMempoolTxTimeout)
+	}
+	return defaultAlternativeMempoolTxTimeout, nil
+}
+
+// AverageBlockTimeDuration returns AverageBlockTimeMs as a time.Duration.
+func (c *Configuration) AverageBlockTimeDuration() (time.Duration, error) {
+	if c.AverageBlockTimeMs <= 0 {
+		return 0, errors.Errorf("averageBlockTimeMs must be a positive integer")
+	}
+	return time.Duration(c.AverageBlockTimeMs) * time.Millisecond, nil
 }
 
 // EthereumRPC is an interface to JSON-RPC eth service.
@@ -102,11 +177,19 @@ type EthereumRPC struct {
 	mempoolInitialized bool
 	bestHeaderLock     sync.Mutex
 	bestHeader         bchain.EVMHeader
-	bestHeaderTime     time.Time
 	// newBlockNotifyCh coalesces bursts of newHeads events into a single wake-up.
 	// This keeps the subscription reader unblocked while we refresh the canonical tip.
-	newBlockNotifyCh          chan struct{}
-	newBlockNotifyOnce        sync.Once
+	newBlockNotifyCh chan struct{}
+	// subscribeReadersOnce guards the long-lived consumer goroutines (tip notifier,
+	// tip watchdog and the NewBlock/NewTx channel readers) so reconnectRPC ->
+	// subscribeEvents only re-creates the connection-bound subscriptions and never
+	// leaks a fresh set of readers on every reconnect.
+	subscribeReadersOnce sync.Once
+	// lastSubNotifyNs is the UnixNano of the last newHeads notification that
+	// advanced the cached tip (subscription path only, never watchdog polls).
+	// Keying liveness on tip advance, not mere arrival, lets the watchdog also
+	// catch a feed that keeps delivering but is stuck on one height.
+	lastSubNotifyNs           atomic.Int64
 	NewBlock                  bchain.EVMNewBlockSubscriber
 	newBlockSubscription      bchain.EVMClientSubscription
 	NewTx                     bchain.EVMNewTxSubscriber
@@ -119,6 +202,10 @@ type EthereumRPC struct {
 	alternativeFeeProvider    alternativeFeeProviderInterface
 	alternativeSendTxProvider *AlternativeSendTxProvider
 	InternalDataProvider      bchain.EthereumInternalDataProvider
+	consensusMonitor          *consensusVersionMonitor
+	// Multicall3 deployment state; lazily probed on first call. See multicall.go.
+	multicall3Probe   atomic.Int32
+	multicall3ProbeSF singleflight.Group
 }
 
 // NewEthereumRPC returns new EthRPC instance.
@@ -168,6 +255,15 @@ func NewEthereumRPC(config json.RawMessage, pushHandler func(bchain.Notification
 			return nil, errors.Annotatef(err, "invalid trace_timeout")
 		}
 	}
+	if _, err := c.MempoolTxTimeoutDuration(false); err != nil {
+		return nil, err
+	}
+	if _, err := c.AlternativeMempoolTxTimeoutDuration(); err != nil {
+		return nil, err
+	}
+	if _, err := c.AverageBlockTimeDuration(); err != nil {
+		return nil, err
+	}
 
 	s := &EthereumRPC{
 		BaseChain:   &bchain.BaseChain{},
@@ -187,6 +283,10 @@ func NewEthereumRPC(config json.RawMessage, pushHandler func(bchain.Notification
 	parser.AddrContractsCacheMaxBytes = c.AddressContractsCacheMaxBytes
 	parser.AddrContractsCacheBulkMaxBytes = c.AddressContractsCacheBulkMaxBytes
 	s.Parser = parser
+	if c.RPCTimeout <= 0 {
+		glog.Warningf("rpc_timeout=%d is invalid, using default %d seconds", c.RPCTimeout, defaultRPCTimeoutSeconds)
+		c.RPCTimeout = defaultRPCTimeoutSeconds
+	}
 	s.Timeout = time.Duration(c.RPCTimeout) * time.Second
 	s.PushHandler = pushHandler
 
@@ -195,6 +295,21 @@ func NewEthereumRPC(config json.RawMessage, pushHandler func(bchain.Notification
 
 func (b *EthereumRPC) SetMetrics(metrics *common.Metrics) {
 	b.metrics = metrics
+}
+
+// AverageBlockTimeDuration exposes the chain's nominal block cadence.
+func (b *EthereumRPC) AverageBlockTimeDuration() (time.Duration, error) {
+	return b.ChainConfig.AverageBlockTimeDuration()
+}
+
+// MissingBlockRetryOverride exposes the per-chain sync-worker retry override
+// (or nil to use built-in defaults). Consumed by blockbook.go at SyncWorker
+// construction via a duck-typed interface assertion.
+func (b *EthereumRPC) MissingBlockRetryOverride() *bchain.MissingBlockRetry {
+	if b.ChainConfig == nil {
+		return nil
+	}
+	return b.ChainConfig.MissingBlockRetry
 }
 
 func (b *EthereumRPC) observeEthCall(mode string, count int) {
@@ -245,6 +360,35 @@ func (b *EthereumRPC) observeEthCallStakingPool(field string) {
 		return
 	}
 	b.metrics.EthCallStakingPool.With(common.Labels{"field": field}).Inc()
+}
+
+func ethSyncRpcErrStatus(err error) string {
+	if stdErrors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var httpErr rpc.HTTPError
+	if stdErrors.As(err, &httpErr) {
+		switch {
+		case httpErr.StatusCode >= 500:
+			return "http_5xx"
+		case httpErr.StatusCode >= 400:
+			return "http_4xx"
+		default:
+			return "http_other"
+		}
+	}
+	var rpcErr rpc.Error
+	if stdErrors.As(err, &rpcErr) {
+		return "rpc_" + strconv.Itoa(rpcErr.ErrorCode())
+	}
+	return "error"
+}
+
+func (b *EthereumRPC) observeEthSyncRpcError(method string, err error) {
+	if b.metrics == nil || err == nil {
+		return
+	}
+	b.metrics.EthSyncRpcErrors.With(common.Labels{"method": method, "status": ethSyncRpcErrStatus(err)}).Inc()
 }
 
 // EnsureSameRPCHost validates both RPC URLs and logs a warning if hosts differ.
@@ -317,6 +461,16 @@ func rpcURLHost(rawURL string) (string, error) {
 	return host, nil
 }
 
+// dialTimeout bounds the initial RPC/WS handshake. A websocket backend behind a
+// load balancer can accept the TCP socket but never complete the upgrade — the
+// exact silent stall tipWatchdog exists to heal. Dialing with context.Background()
+// then blocks forever, and because reconnectRPC runs on the lone tipWatchdog
+// goroutine that single healer parks indefinitely: the cached tip stays frozen,
+// resyncIndex keeps reporting a false syncNotNeeded, and sync silently stalls until
+// a restart. go-ethereum uses this context only for the first handshake, so the
+// established connection's lifetime is unaffected. A var so tests can shorten it.
+var dialTimeout = 30 * time.Second
+
 func dialRPC(rawURL string) (*rpc.Client, error) {
 	if rawURL == "" {
 		return nil, errors.New("empty rpc url")
@@ -325,7 +479,9 @@ func dialRPC(rawURL string) (*rpc.Client, error) {
 	if strings.HasPrefix(rawURL, "ws://") || strings.HasPrefix(rawURL, "wss://") {
 		opts = append(opts, rpc.WithWebsocketMessageSizeLimit(0))
 	}
-	return rpc.DialOptions(context.Background(), rawURL, opts...)
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return rpc.DialOptions(ctx, rawURL, opts...)
 }
 
 // OpenRPC opens RPC connection to ETH backend.
@@ -398,29 +554,149 @@ func (b *EthereumRPC) Initialize() error {
 		return err
 	}
 
-	b.InitAlternativeProviders()
+	if err = b.InitAlternativeProviders(); err != nil {
+		return err
+	}
+
+	b.consensusMonitor = newConsensusVersionMonitor(b.ChainConfig.ConsensusNodeVersionURL)
+	b.consensusMonitor.start()
 
 	glog.Info("rpc: block chain ", b.Network)
 
 	return nil
 }
 
+const (
+	consensusVersionUnreachable = "unreachable-locally"
+	consensusVersionPollPeriod  = 60 * time.Second
+)
+
+// consensusVersionMonitor probes the configured consensus node /eth/v1/node/version
+// endpoint and caches the latest result. The cached value (real version or
+// "unreachable-locally") is the signal exposed via getInfo and the Prometheus
+// backend_subversion label; periodic re-probes are silent so a node being
+// down does not spam the log.
+type consensusVersionMonitor struct {
+	url      string
+	mu       sync.RWMutex
+	version  string
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func newConsensusVersionMonitor(url string) *consensusVersionMonitor {
+	if url == "" {
+		return nil
+	}
+	return &consensusVersionMonitor{url: url, stop: make(chan struct{})}
+}
+
+// start performs an initial synchronous probe (logging one WARN if it fails)
+// and then launches a background goroutine that re-probes every
+// consensusVersionPollPeriod. Safe to call on a nil receiver.
+func (m *consensusVersionMonitor) start() {
+	if m == nil {
+		return
+	}
+	v, err := m.fetch()
+	if err != nil {
+		glog.Warningf("consensus node version probe failed for %s: %v", m.url, err)
+		v = consensusVersionUnreachable
+	}
+	m.set(v)
+	go m.run()
+}
+
+func (m *consensusVersionMonitor) run() {
+	ticker := time.NewTicker(consensusVersionPollPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-ticker.C:
+			v, err := m.fetch()
+			if err != nil {
+				v = consensusVersionUnreachable
+			}
+			m.set(v)
+		}
+	}
+}
+
+func (m *consensusVersionMonitor) fetch() (string, error) {
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	resp, err := httpClient.Get(m.url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var v struct {
+		Data struct {
+			Version string `json:"version"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return "", err
+	}
+	return v.Data.Version, nil
+}
+
+func (m *consensusVersionMonitor) set(v string) {
+	m.mu.Lock()
+	m.version = v
+	m.mu.Unlock()
+}
+
+func (m *consensusVersionMonitor) get() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.version
+}
+
+func (m *consensusVersionMonitor) shutdown() {
+	if m == nil {
+		return
+	}
+	m.stopOnce.Do(func() { close(m.stop) })
+}
+
 // InitAlternativeProviders initializes alternative providers
-func (b *EthereumRPC) InitAlternativeProviders() {
+func (b *EthereumRPC) InitAlternativeProviders() error {
 	b.initAlternativeFeeProvider()
 
+	// Env prefix follows explicit network aliases such as OP/BASE, otherwise ETH.
 	network := b.ChainConfig.Network
 	if network == "" {
 		network = b.ChainConfig.CoinShortcut
 	}
-	b.alternativeSendTxProvider = NewAlternativeSendTxProvider(network, b.ChainConfig.RPCTimeout, b.ChainConfig.MempoolTxTimeoutHours)
+	alternativeMempoolTxTimeout, err := b.ChainConfig.AlternativeMempoolTxTimeoutDuration()
+	if err != nil {
+		return err
+	}
+	b.alternativeSendTxProvider = NewAlternativeSendTxProvider(network, b.ChainConfig.RPCTimeout, alternativeMempoolTxTimeout)
+	return nil
 }
 
 // CreateMempool creates mempool if not already created, however does not initialize it
 func (b *EthereumRPC) CreateMempool(chain bchain.BlockChain) (bchain.Mempool, error) {
 	if b.Mempool == nil {
-		b.Mempool = bchain.NewMempoolEthereumType(chain, b.ChainConfig.MempoolTxTimeoutHours, b.ChainConfig.QueryBackendOnMempoolResync)
-		glog.Info("mempool created, MempoolTxTimeoutHours=", b.ChainConfig.MempoolTxTimeoutHours, ", QueryBackendOnMempoolResync=", b.ChainConfig.QueryBackendOnMempoolResync, ", DisableMempoolSync=", b.ChainConfig.DisableMempoolSync)
+		mempoolTxTimeout, err := b.ChainConfig.MempoolTxTimeoutDuration(b.alternativeSendTxProvider != nil)
+		if err != nil {
+			return nil, err
+		}
+		b.Mempool = bchain.NewMempoolEthereumType(chain, mempoolTxTimeout, b.ChainConfig.QueryBackendOnMempoolResync)
+		glog.Info("mempool created, MempoolTxTimeout=", mempoolTxTimeout, ", QueryBackendOnMempoolResync=", b.ChainConfig.QueryBackendOnMempoolResync, ", DisableMempoolSync=", b.ChainConfig.DisableMempoolSync)
 		if b.alternativeSendTxProvider != nil {
 			b.alternativeSendTxProvider.SetupMempool(b.Mempool, b.removeTransactionFromMempool)
 		}
@@ -430,7 +706,7 @@ func (b *EthereumRPC) CreateMempool(chain bchain.BlockChain) (bchain.Mempool, er
 }
 
 // InitializeMempool creates subscriptions to newHeads and newPendingTransactions
-func (b *EthereumRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOutpointFunc, onNewTxAddr bchain.OnNewTxAddrFunc, onNewTx bchain.OnNewTxFunc) error {
+func (b *EthereumRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOutpointFunc, onNewTx bchain.OnNewTxFunc) error {
 	if b.Mempool == nil {
 		return errors.New("Mempool not created")
 	}
@@ -452,7 +728,6 @@ func (b *EthereumRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOu
 		b.Mempool.AddTransactionToMempool(txid)
 	}
 
-	b.Mempool.OnNewTxAddr = onNewTxAddr
 	b.Mempool.OnNewTx = onNewTx
 
 	if err = b.subscribeEvents(); err != nil {
@@ -465,22 +740,48 @@ func (b *EthereumRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOu
 }
 
 func (b *EthereumRPC) subscribeEvents() error {
-	b.newBlockNotifyOnce.Do(func() {
+	// The tip notifier, tip watchdog and the NewBlock/NewTx channel readers bind to
+	// the persistent channels, not to a specific connection, so start them exactly
+	// once. reconnectRPC -> subscribeEvents then only re-creates the EthSubscribe
+	// bound subscriptions below, instead of leaking a fresh reader set per reconnect.
+	b.subscribeReadersOnce.Do(func() {
 		go b.newBlockNotifier()
-	})
-	// new block notifications handling
-	go func() {
-		for {
-			_, ok := b.NewBlock.Read()
-			if !ok {
-				break
+		go b.tipWatchdog()
+		// new block notifications handling
+		go func() {
+			for {
+				h, ok := b.NewBlock.Read()
+				if !ok {
+					break
+				}
+				// Advance the tip from the delivered header, not a re-query over
+				// the load-balanced HTTP path (see onFeedHeader).
+				b.onFeedHeader(h)
 			}
-			b.signalNewBlock()
+		}()
+		// new mempool transaction notifications handling
+		if !b.ChainConfig.DisableMempoolSync {
+			go func() {
+				for {
+					t, ok := b.NewTx.Read()
+					if !ok {
+						break
+					}
+					hex := t.Hex()
+					if glog.V(2) {
+						glog.Info("rpc: new tx ", hex)
+					}
+					added := b.Mempool.AddTransactionToMempool(hex)
+					if added {
+						b.PushHandler(bchain.NotificationNewTx)
+					}
+				}
+			}()
 		}
-	}()
+	})
 
-	// new block subscription
-	if err := b.subscribe(func() (bchain.EVMClientSubscription, error) {
+	// new block subscription - re-created on every (re)connect
+	if err := b.subscribe("newHeads", func() (bchain.EVMClientSubscription, error) {
 		// invalidate the previous subscription - it is either the first one or there was an error
 		b.newBlockSubscription = nil
 		ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
@@ -496,27 +797,17 @@ func (b *EthereumRPC) subscribeEvents() error {
 		return err
 	}
 
-	// new mempool transaction notifications handling
-	go func() {
-		for {
-			t, ok := b.NewTx.Read()
-			if !ok {
-				break
-			}
-			hex := t.Hex()
-			if glog.V(2) {
-				glog.Info("rpc: new tx ", hex)
-			}
-			added := b.Mempool.AddTransactionToMempool(hex)
-			if added {
-				b.PushHandler(bchain.NotificationNewTx)
-			}
-		}
-	}()
+	// Arm lastSubNotifyNs at subscribe time, not only on the first tip advance.
+	// Liveness is otherwise stamped only when a header advances the tip, so a
+	// subscription that never delivers a usable header leaves it at 0 and keeps
+	// tipWatchdog's lastNs == 0 gate closed forever: the cached tip never refreshes
+	// and resyncIndex reports a silent syncNotNeeded. Seeding here lets a stalled
+	// feed age past the threshold so the watchdog polls and reconnects.
+	b.markSubscriptionAlive()
 
 	if !b.ChainConfig.DisableMempoolSync {
-		// new mempool transaction subscription
-		if err := b.subscribe(func() (bchain.EVMClientSubscription, error) {
+		// new mempool transaction subscription - re-created on every (re)connect
+		if err := b.subscribe("newPendingTransactions", func() (bchain.EVMClientSubscription, error) {
 			// invalidate the previous subscription - it is either the first one or there was an error
 			b.newTxSubscription = nil
 			ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
@@ -537,7 +828,7 @@ func (b *EthereumRPC) subscribeEvents() error {
 }
 
 // subscribe subscribes notification and tries to resubscribe in case of error
-func (b *EthereumRPC) subscribe(f func() (bchain.EVMClientSubscription, error)) error {
+func (b *EthereumRPC) subscribe(name string, f func() (bchain.EVMClientSubscription, error)) error {
 	s, err := f()
 	if err != nil {
 		return err
@@ -551,7 +842,8 @@ func (b *EthereumRPC) subscribe(f func() (bchain.EVMClientSubscription, error)) 
 			if e == nil {
 				return
 			}
-			glog.Error("Subscription error ", e)
+			glog.Error("Subscription error ", name, ": ", e)
+			b.ObserveSubscriptionEvent(name, "error")
 			timer := time.NewTimer(time.Second * 2)
 			// try in 2 second interval to resubscribe
 			for {
@@ -564,10 +856,12 @@ func (b *EthereumRPC) subscribe(f func() (bchain.EVMClientSubscription, error)) 
 					ns, err := f()
 					if err == nil {
 						// subscription successful, restart wait for next error
+						b.ObserveSubscriptionEvent(name, "resubscribed")
 						s = ns
 						continue Loop
 					}
-					glog.Error("Resubscribe error ", err)
+					glog.Error("Resubscribe error ", name, ": ", err)
+					b.ObserveSubscriptionEvent(name, "resubscribe_failed")
 					timer.Reset(time.Second * 2)
 				}
 			}
@@ -579,13 +873,13 @@ func (b *EthereumRPC) subscribe(f func() (bchain.EVMClientSubscription, error)) 
 func (b *EthereumRPC) initAlternativeFeeProvider() {
 	var err error
 	if b.ChainConfig.AlternativeEstimateFee == "1inch" {
-		if b.alternativeFeeProvider, err = NewOneInchFeesProvider(b, b.ChainConfig.AlternativeEstimateFeeParams); err != nil {
+		if b.alternativeFeeProvider, err = NewOneInchFeesProvider(b, b.ChainConfig.AlternativeEstimateFeeParams, b.metrics); err != nil {
 			glog.Error("New1InchFeesProvider error ", err, " Reverting to default estimateFee functionality")
 			// disable AlternativeEstimateFee logic
 			b.alternativeFeeProvider = nil
 		}
 	} else if b.ChainConfig.AlternativeEstimateFee == "infura" {
-		if b.alternativeFeeProvider, err = NewInfuraFeesProvider(b, b.ChainConfig.AlternativeEstimateFeeParams); err != nil {
+		if b.alternativeFeeProvider, err = NewInfuraFeesProvider(b, b.ChainConfig.AlternativeEstimateFeeParams, b.metrics); err != nil {
 			glog.Error("NewInfuraFeesProvider error ", err, " Reverting to default estimateFee functionality")
 			// disable AlternativeEstimateFee logic
 			b.alternativeFeeProvider = nil
@@ -609,6 +903,13 @@ func (b *EthereumRPC) closeRPC() {
 	}
 }
 
+// CloseRPC closes the underlying RPC client, aborting any in-flight calls.
+// Exported so embedders (e.g. Tron) can abort sync RPCs on shutdown without
+// running the EVM-specific subscription/monitor teardown done by Shutdown.
+func (b *EthereumRPC) CloseRPC() {
+	b.closeRPC()
+}
+
 func (b *EthereumRPC) reconnectRPC() error {
 	glog.Info("Reconnecting RPC")
 	b.closeRPC()
@@ -626,6 +927,7 @@ func (b *EthereumRPC) Shutdown(ctx context.Context) error {
 	b.closeRPC()
 	b.NewBlock.Close()
 	b.NewTx.Close()
+	b.consensusMonitor.shutdown()
 	glog.Info("rpc: shutdown")
 	return nil
 }
@@ -638,37 +940,6 @@ func (b *EthereumRPC) GetCoinName() string {
 // GetSubversion returns empty string, ethereum does not have subversion
 func (b *EthereumRPC) GetSubversion() string {
 	return ""
-}
-
-func (b *EthereumRPC) getConsensusVersion() string {
-	if b.ChainConfig.ConsensusNodeVersionURL == "" {
-		return ""
-	}
-	httpClient := &http.Client{
-		Timeout: 2 * time.Second,
-	}
-	resp, err := httpClient.Get(b.ChainConfig.ConsensusNodeVersionURL)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		glog.Error("getConsensusVersion ", err)
-		return ""
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		glog.Error("getConsensusVersion ", err)
-		return ""
-	}
-	type consensusVersion struct {
-		Data struct {
-			Version string `json:"version"`
-		} `json:"data"`
-	}
-	var v consensusVersion
-	err = json.Unmarshal(body, &v)
-	if err != nil {
-		glog.Error("getConsensusVersion ", err)
-		return ""
-	}
-	return v.Data.Version
 }
 
 // GetChainInfo returns information about the connected backend
@@ -687,13 +958,12 @@ func (b *EthereumRPC) GetChainInfo() (*bchain.ChainInfo, error) {
 	if err := b.RPC.CallContext(ctx, &ver, "web3_clientVersion"); err != nil {
 		return nil, err
 	}
-	consensusVersion := b.getConsensusVersion()
 	rv := &bchain.ChainInfo{
 		Blocks:           int(h.Number().Int64()),
 		Bestblockhash:    h.Hash(),
 		Difficulty:       h.Difficulty().String(),
 		Version:          ver,
-		ConsensusVersion: consensusVersion,
+		ConsensusVersion: b.consensusMonitor.get(),
 	}
 	idi := int(id.Uint64())
 	if idi == int(b.MainNetChainID) {
@@ -707,15 +977,11 @@ func (b *EthereumRPC) GetChainInfo() (*bchain.ChainInfo, error) {
 func (b *EthereumRPC) getBestHeader() (bchain.EVMHeader, error) {
 	b.bestHeaderLock.Lock()
 	defer b.bestHeaderLock.Unlock()
-	// if the best header was not updated for 15 minutes, there could be a subscription problem, reconnect RPC
-	// do it only in case of normal operation, not initial synchronization
-	if b.bestHeaderTime.Add(15*time.Minute).Before(time.Now()) && !b.bestHeaderTime.IsZero() && b.mempoolInitialized {
-		err := b.reconnectRPC()
-		if err != nil {
-			return nil, err
-		}
-		b.bestHeader = nil
-	}
+	// Subscription liveness (detecting a silently stalled newHeads feed and
+	// reconnecting) is owned by tipWatchdog, which runs off the bestHeaderLock so a
+	// reconnect can no longer block every concurrent tip reader. Here we only lazily
+	// fetch the very first header; afterwards the cache is advanced by the
+	// subscription-driven newBlockNotifier and by the watchdog's fallback poll.
 	if b.bestHeader == nil {
 		var err error
 		ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
@@ -725,42 +991,204 @@ func (b *EthereumRPC) getBestHeader() (bchain.EVMHeader, error) {
 			b.bestHeader = nil
 			return nil, err
 		}
-		b.bestHeaderTime = time.Now()
 	}
 	return b.bestHeader, nil
 }
 
-// UpdateBestHeader keeps track of the latest block header confirmed on chain
+// UpdateBestHeader keeps track of the latest block header confirmed on chain.
+// Non-monotonic: callers (Tron's ZeroMQ feed) own their ordering/reorg handling.
 func (b *EthereumRPC) UpdateBestHeader(h bchain.EVMHeader) {
 	if h == nil || h.Number() == nil {
 		return
 	}
 	glog.V(2).Info("rpc: new block header ", h.Number().Uint64())
-	b.setBestHeader(h)
+	b.setBestHeader(h, false)
 }
 
 func (b *EthereumRPC) signalNewBlock() {
-	// Non-blocking send: one pending signal is enough to refresh the tip.
+	// Non-blocking send: one pending signal is enough to wake the sync loop.
 	select {
 	case b.newBlockNotifyCh <- struct{}{}:
 	default:
 	}
 }
 
-func (b *EthereumRPC) newBlockNotifier() {
-	for range b.newBlockNotifyCh {
-		updated, err := b.refreshBestHeaderFromChain()
-		if err != nil {
-			glog.Error("refreshBestHeaderFromChain ", err)
-			continue
-		}
-		if updated {
-			b.PushHandler(bchain.NotificationNewBlock)
-		}
+// onFeedHeader advances the cached tip from the header the newHeads feed just
+// delivered (not a re-query over HTTP) and, only on a real advance, refreshes
+// liveness and wakes the sync loop. Behind a load balancer an HTTP re-query can
+// hit a lagging node and report a stale tip, freezing sync into a false "synced"
+// while newHeads still flows; the feed's header is authoritative. The update is
+// monotonic so a resubscribe onto a behind node cannot regress the tip.
+func (b *EthereumRPC) onFeedHeader(h bchain.EVMHeader) {
+	if b.setBestHeader(h, true) {
+		b.markSubscriptionAlive()
+		b.signalNewBlock()
 	}
 }
 
-func (b *EthereumRPC) refreshBestHeaderFromChain() (bool, error) {
+// newBlockNotifier wakes the sync loop after onFeedHeader advanced the tip. It is
+// decoupled from the reader via newBlockNotifyCh so a slow PushHandler cannot
+// stall the reader and back the newHeads channel up.
+func (b *EthereumRPC) newBlockNotifier() {
+	for range b.newBlockNotifyCh {
+		b.PushHandler(bchain.NotificationNewBlock)
+	}
+}
+
+const (
+	// tipWatchdogStaleBlocks scales the silent-stall window to the chain's cadence:
+	// if no newHeads notification arrives for this many nominal block intervals, the
+	// subscription is presumed dead and the watchdog heals it. Behind a load
+	// balancer a newHeads feed can stop delivering with no error on sub.Err(), so a
+	// purely error-driven resubscribe never fires.
+	tipWatchdogStaleBlocks = 30
+	// tipWatchdogMinStale / tipWatchdogMaxStale clamp the derived window so fast
+	// chains do not react to routine jitter and slow/misconfigured chains still
+	// recover in bounded time (the previous behaviour was a fixed 15 minutes, which
+	// on Polygon's 2s blocks meant ~450 missed blocks before any reaction).
+	tipWatchdogMinStale = 30 * time.Second
+	tipWatchdogMaxStale = 5 * time.Minute
+	// tipWatchdogMinInterval / tipWatchdogMaxInterval bound the sampling cadence.
+	tipWatchdogMinInterval = 5 * time.Second
+	tipWatchdogMaxInterval = 60 * time.Second
+)
+
+// ObserveSubscriptionEvent records a push-subscription lifecycle event. Exported
+// so embedders with their own notification feed (e.g. Tron's ZeroMQ) emit the
+// same metric.
+func (b *EthereumRPC) ObserveSubscriptionEvent(subscription, event string) {
+	if b.metrics == nil {
+		return
+	}
+	b.metrics.BackendSubscriptionEvents.With(common.Labels{"subscription": subscription, "event": event}).Inc()
+}
+
+// SetSubscriptionAgeSeconds records the age of the newest notification from the
+// tip feed. Exported for embedders that run their own watchdog.
+func (b *EthereumRPC) SetSubscriptionAgeSeconds(seconds float64) {
+	if b.metrics == nil {
+		return
+	}
+	b.metrics.BackendSubscriptionAgeSeconds.Set(seconds)
+}
+
+// markSubscriptionAlive records that the feed just advanced the cached tip — the
+// signal tipWatchdog uses to tell a live, progressing feed from one that went
+// silent or got stuck on a single height.
+func (b *EthereumRPC) markSubscriptionAlive() {
+	b.lastSubNotifyNs.Store(time.Now().UnixNano())
+}
+
+// TipStaleThreshold derives the silent-feed window from the chain's average block
+// time, clamped to a sane range. Exported so embedders (Tron, Avalanche) size
+// their watchdog window with the same policy.
+func (b *EthereumRPC) TipStaleThreshold() time.Duration {
+	avg := time.Duration(b.ChainConfig.AverageBlockTimeMs) * time.Millisecond
+	if avg <= 0 {
+		return tipWatchdogMaxStale
+	}
+	d := tipWatchdogStaleBlocks * avg
+	if d < tipWatchdogMinStale {
+		return tipWatchdogMinStale
+	}
+	if d > tipWatchdogMaxStale {
+		return tipWatchdogMaxStale
+	}
+	return d
+}
+
+// tipWatchdog detects a newHeads subscription that has silently stopped
+// delivering (common behind load balancers, which can drop the upstream without
+// signalling sub.Err()). On a stall it first polls the tip directly so sync keeps
+// progressing instead of trusting a frozen cached tip as "synced", then reconnects
+// to restore push delivery. It is started exactly once via subscribeReadersOnce.
+func (b *EthereumRPC) tipWatchdog() {
+	threshold := b.TipStaleThreshold()
+	interval := threshold / 3
+	if interval < tipWatchdogMinInterval {
+		interval = tipWatchdogMinInterval
+	}
+	if interval > tipWatchdogMaxInterval {
+		interval = tipWatchdogMaxInterval
+	}
+	glog.Infof("rpc: tip watchdog started, stall threshold %s, sampling every %s", threshold, interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if common.IsInShutdown() {
+			return
+		}
+		b.tipWatchdogTick(threshold)
+	}
+}
+
+// tipWatchdogTick is one watchdog evaluation, split out from the ticker loop so
+// it is unit-testable with an injected threshold and a fake client (no 30s wait).
+func (b *EthereumRPC) tipWatchdogTick(threshold time.Duration) {
+	// Heartbeat first: this Inc proves the lone watchdog goroutine is still ticking.
+	// If it ever parks (e.g. a hung reconnect), the counter stops and
+	// rate(blockbook_backend_subscription_events{event="watchdog_tick"}) drops to 0 —
+	// the only positive liveness signal for the sole feed-liveness healer, distinct
+	// from watchdog_stall/watchdog_reconnect which fire only on an already-seen stall.
+	b.ObserveSubscriptionEvent("newHeads", "watchdog_tick")
+	// lastSubNotifyNs is armed when subscribeEvents establishes the newHeads
+	// subscription and refreshed on every tip advance, so a non-zero value means
+	// "subscription is wired up". The zero guard only skips the brief window before
+	// the first subscribe (i.e. before InitializeMempool runs); it must not be the
+	// sole arming signal, or a feed that never advances would keep the watchdog off.
+	lastNs := b.lastSubNotifyNs.Load()
+	if lastNs == 0 {
+		return
+	}
+	age := time.Since(time.Unix(0, lastNs))
+	b.SetSubscriptionAgeSeconds(age.Seconds())
+	if age < threshold {
+		return
+	}
+	glog.Warningf("rpc: newHeads subscription silent for %s (threshold %s); polling tip and reconnecting", age.Truncate(time.Second), threshold)
+	b.ObserveSubscriptionEvent("newHeads", "watchdog_stall")
+	// Keep sync alive immediately: poll the canonical tip directly so a dead push
+	// channel can no longer freeze the cached tip into a false "synced". The poll is
+	// allowed to regress the tip here (unlike the hot path): after a sustained stall
+	// a lower backend height is a real rollback, not the transient load-balancer lag
+	// the monotonic guard filters (that lag resolves well within the stall window).
+	// Without this, a genuine rollback would leave the cached tip pinned above the
+	// backend and equal to the local DB tip, so resyncIndex keeps early-exiting as
+	// "synced" and never reaches its fork path (db/sync.go GetBlockHash check).
+	prevHeight := b.cachedTipHeight()
+	if updated, err := b.refreshBestHeaderFromChain(true); err != nil {
+		glog.Error("rpc: tip watchdog tip poll error ", err)
+	} else if updated {
+		if newHeight := b.cachedTipHeight(); newHeight < prevHeight {
+			glog.Warningf("rpc: tip watchdog observed backend rollback, cached tip %d -> %d; letting sync reconcile the fork", prevHeight, newHeight)
+			b.ObserveSubscriptionEvent("newHeads", "watchdog_tip_rollback")
+		} else {
+			b.ObserveSubscriptionEvent("newHeads", "watchdog_tip_advanced")
+		}
+		b.PushHandler(bchain.NotificationNewBlock)
+	}
+	// Restore push delivery by reconnecting the RPC and re-subscribing.
+	if err := b.reconnectRPC(); err != nil {
+		glog.Error("rpc: tip watchdog reconnect error ", err)
+		b.ObserveSubscriptionEvent("rpc", "watchdog_reconnect_failed")
+		return
+	}
+	b.ObserveSubscriptionEvent("rpc", "watchdog_reconnect")
+	// Give the fresh subscription a full window before judging it again so a
+	// flapping backend cannot trigger a reconnect storm.
+	b.markSubscriptionAlive()
+}
+
+// refreshBestHeaderFromChain polls the tip over HTTP. It is the watchdog's
+// fallback when the push feed is silent (no longer on the hot path).
+//
+// allowRegress controls the monotonic guard. Callers on the hot path pass false so
+// a lagging load-balancer node cannot regress the tip and trip a spurious fork. The
+// watchdog passes true: it only polls after a sustained stall (TipStaleThreshold),
+// by which point transient routing lag has resolved, so a still-lower backend tip
+// is a genuine rollback the cached tip must follow down — otherwise the guard pins
+// the tip above the backend and resyncIndex keeps reporting a false "synced".
+func (b *EthereumRPC) refreshBestHeaderFromChain(allowRegress bool) (bool, error) {
 	if b.Client == nil {
 		return false, errors.New("rpc client not initialized")
 	}
@@ -773,28 +1201,45 @@ func (b *EthereumRPC) refreshBestHeaderFromChain() (bool, error) {
 	if h == nil || h.Number() == nil {
 		return false, errors.New("best header is nil")
 	}
-	return b.setBestHeader(h), nil
+	return b.setBestHeader(h, !allowRegress), nil
 }
 
-func (b *EthereumRPC) setBestHeader(h bchain.EVMHeader) bool {
+// setBestHeader stores h as the cached tip and reports whether it changed (new
+// height, or same-height hash change i.e. a tip reorg). When monotonic, a lower
+// height is rejected so a lagging load-balancer node cannot regress the tip and
+// trip a spurious fork. A sustained real rollback (the backend genuinely below the
+// cached tip past TipStaleThreshold) is instead recovered by tipWatchdog, which
+// re-polls with the guard lifted so the tip follows the backend down and resyncIndex
+// reaches its fork path; see refreshBestHeaderFromChain.
+func (b *EthereumRPC) setBestHeader(h bchain.EVMHeader, monotonic bool) bool {
 	if h == nil || h.Number() == nil {
 		return false
 	}
 	b.bestHeaderLock.Lock()
 	defer b.bestHeaderLock.Unlock()
-	changed := false
-	if b.bestHeader == nil || b.bestHeader.Number() == nil {
-		changed = true
-	} else {
+	if b.bestHeader != nil && b.bestHeader.Number() != nil {
 		prevNum := b.bestHeader.Number().Uint64()
 		newNum := h.Number().Uint64()
-		if prevNum != newNum || b.bestHeader.Hash() != h.Hash() {
-			changed = true
+		if newNum == prevNum && b.bestHeader.Hash() == h.Hash() {
+			return false // identical tip: not progress
+		}
+		if monotonic && newNum < prevNum {
+			return false // lagging node: keep the higher tip
 		}
 	}
 	b.bestHeader = h
-	b.bestHeaderTime = time.Now()
-	return changed
+	return true
+}
+
+// cachedTipHeight returns the height of the cached tip, or 0 if it is unset. The
+// watchdog uses it to tell a forward advance from a rollback for logging/metrics.
+func (b *EthereumRPC) cachedTipHeight() uint64 {
+	b.bestHeaderLock.Lock()
+	defer b.bestHeaderLock.Unlock()
+	if b.bestHeader == nil || b.bestHeader.Number() == nil {
+		return 0
+	}
+	return b.bestHeader.Number().Uint64()
 }
 
 // GetBestBlockHash returns hash of the tip of the best-block-chain
@@ -823,7 +1268,7 @@ func (b *EthereumRPC) GetBlockHash(height uint32) (string, error) {
 	defer cancel()
 	h, err := b.Client.HeaderByNumber(ctx, &n)
 	if err != nil {
-		if err == ethereum.NotFound {
+		if err == ethereum.NotFound || stdErrors.Is(err, bchain.ErrBlockNotFound) {
 			return "", bchain.ErrBlockNotFound
 		}
 		return "", errors.Annotatef(err, "height %v", height)
@@ -886,15 +1331,20 @@ func (b *EthereumRPC) getBlockRaw(hash string, height uint32, fullTxs bool) (jso
 	defer cancel()
 	var raw json.RawMessage
 	var err error
+	var method string
 	if hash != "" {
 		if hash == "pending" {
-			err = b.RPC.CallContext(ctx, &raw, "eth_getBlockByNumber", hash, fullTxs)
+			method = "eth_getBlockByNumber"
+			err = b.RPC.CallContext(ctx, &raw, method, hash, fullTxs)
 		} else {
-			err = b.RPC.CallContext(ctx, &raw, "eth_getBlockByHash", ethcommon.HexToHash(hash), fullTxs)
+			method = "eth_getBlockByHash"
+			err = b.RPC.CallContext(ctx, &raw, method, ethcommon.HexToHash(hash), fullTxs)
 		}
 	} else {
-		err = b.RPC.CallContext(ctx, &raw, "eth_getBlockByNumber", fmt.Sprintf("%#x", height), fullTxs)
+		method = "eth_getBlockByNumber"
+		err = b.RPC.CallContext(ctx, &raw, method, fmt.Sprintf("%#x", height), fullTxs)
 	}
+	b.observeEthSyncRpcError(method, err)
 	if err != nil {
 		return nil, errors.Annotatef(err, "hash %v, height %v", hash, height)
 	} else if len(raw) == 0 || (len(raw) == 4 && string(raw) == "null") {
@@ -913,12 +1363,14 @@ func (b *EthereumRPC) processEventsForBlock(blockNumber string) (map[string][]*b
 	defer cancel()
 	var logs []rpcLogWithTxHash
 	var ensRecords []bchain.AddressAliasRecord
-	err := b.RPC.CallContext(ctx, &logs, "eth_getLogs", map[string]interface{}{
+	var method = "eth_getLogs"
+	err := b.RPC.CallContext(ctx, &logs, method, map[string]interface{}{
 		"fromBlock": blockNumber,
 		"toBlock":   blockNumber,
 	})
+	b.observeEthSyncRpcError(method, err)
 	if err != nil {
-		return nil, nil, errors.Annotatef(err, "eth_getLogs blockNumber %v", blockNumber)
+		return nil, nil, errors.Annotatef(err, "%s blockNumber %v", method, blockNumber)
 	}
 	r := make(map[string][]*bchain.RpcLog)
 	for i := range logs {
@@ -1017,6 +1469,7 @@ func (b *EthereumRPC) getInternalDataForBlock(ctx context.Context, blockHash str
 			traceConfig["timeout"] = b.ChainConfig.TraceTimeout
 		}
 		err := b.RPC.CallContext(ctx, &trace, "debug_traceBlockByHash", blockHash, traceConfig) // Use caller-provided ctx for timeout/cancel.
+		b.observeEthSyncRpcError("debug_traceBlockByHash", err)
 		if err != nil {
 			glog.Error("debug_traceBlockByHash block ", blockHash, ", error ", err)
 			return data, contracts, err
@@ -1391,7 +1844,15 @@ func (b *EthereumRPC) EthereumTypeGetEip1559Fees() (*bchain.Eip1559Fees, error) 
 	}
 	// if there is an alternative provider, use it
 	if b.alternativeFeeProvider != nil {
-		return b.alternativeFeeProvider.GetEip1559Fees()
+		fees, err := b.alternativeFeeProvider.GetEip1559Fees()
+		if err != nil {
+			return nil, err
+		}
+		if fees != nil {
+			return fees, nil
+		}
+		// Fall back to on-chain estimation when the alternative provider is unsupported/stale/unready,
+		// so configured networks still return EIP-1559 fees instead of nil, which resolves to empty fees.
 	}
 
 	// otherwise use algorithm from here https://docs.alchemy.com/docs/how-to-build-a-gas-fee-estimator-using-eip-1559

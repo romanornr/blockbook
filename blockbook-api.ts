@@ -14,6 +14,7 @@ export interface TronVoteExtra {
 export interface TronChainExtraData {
     contractType?: string;
     operation?: string;
+    note?: string;
     resource?: string;
     stakeAmount?: string;
     unstakeAmount?: string;
@@ -29,6 +30,26 @@ export interface TronChainExtraData {
     result?: string;
     votes?: TronVoteExtra[];
 }
+export interface TronVote {
+    address: string;
+    voteCount: string;
+}
+export interface TronUnstakingBatch {
+    amount: string;
+    expireTime: number;
+}
+export interface TronStakingInfo {
+    stakedBalance: string;
+    stakedBalanceEnergy: string;
+    stakedBalanceBandwidth: string;
+    unstakingBatches: TronUnstakingBatch[];
+    totalVotingPower: string;
+    availableVotingPower: string;
+    votes: TronVote[];
+    unclaimedReward: string;
+    delegatedBalanceEnergy: string;
+    delegatedBalanceBandwidth: string;
+}
 export interface TronAccountExtraData {
     availableStakedBandwidth: number;
     totalStakedBandwidth: number;
@@ -36,6 +57,7 @@ export interface TronAccountExtraData {
     totalFreeBandwidth: number;
     availableEnergy: number;
     totalEnergy: number;
+    stakingInfo?: TronStakingInfo;
 }
 export type TxChainExtraData = { payloadType: 'tron'; payload?: TronChainExtraData } | { payloadType: string; payload?: any };
 export type AccountChainExtraData = { payloadType: 'tron'; payload?: TronAccountExtraData } | { payloadType: string; payload?: any };
@@ -319,8 +341,8 @@ export interface Token {
     totalReceived?: string;
     /** Total amount of tokens sent. */
     totalSent?: string;
-    /** Optional protocol-specific enrichments requested by the caller. */
-    protocols?: ContractInfoProtocols;
+    /** Protocol identifiers the contract participates in (e.g., "erc4626"); for fresh per-vault data, use getContractInfo. */
+    protocols?: string[];
 }
 export interface Address {
     /** Current page index. */
@@ -337,7 +359,7 @@ export interface Address {
     totalReceived?: string;
     /** Total amount ever sent by this address. */
     totalSent?: string;
-    /** Unconfirmed balance for this address. */
+    /** Unconfirmed balance for this address. Omitted for AccountDetailsBasic, where mempool transactions are not aggregated. */
     unconfirmedBalance?: string;
     /** Number of unconfirmed transactions for this address. */
     unconfirmedTxs: number;

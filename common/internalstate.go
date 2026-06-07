@@ -92,6 +92,8 @@ type InternalState struct {
 
 	BackendInfo BackendInfo `json:"-" ts_doc:"Information about the connected blockchain backend (not exposed in JSON)."`
 
+	BackendTipLastAdvance time.Time `json:"-" ts_doc:"Wall-clock time when BackendInfo.Blocks was last observed to advance (not exposed in JSON)."`
+
 	// database migrations
 	UtxoChecked            bool `json:"utxoChecked" ts_doc:"Indicates if UTXO consistency checks have been performed."`
 	SortedAddressContracts bool `json:"sortedAddressContracts" ts_doc:"Indicates if address/contract sorting has been completed."`
@@ -329,10 +331,15 @@ func (is *InternalState) GetNetwork() string {
 	return network
 }
 
-// SetBackendInfo sets new BackendInfo
+// SetBackendInfo sets new BackendInfo and records the time when Blocks advances.
+// On the first observation the advance time is seeded to now so the
+// derived tip-age metric reads a meaningful value instead of "since epoch."
 func (is *InternalState) SetBackendInfo(bi *BackendInfo) {
 	is.mux.Lock()
 	defer is.mux.Unlock()
+	if bi.Blocks > is.BackendInfo.Blocks || is.BackendTipLastAdvance.IsZero() {
+		is.BackendTipLastAdvance = time.Now()
+	}
 	is.BackendInfo = *bi
 }
 
@@ -341,6 +348,19 @@ func (is *InternalState) GetBackendInfo() BackendInfo {
 	is.mux.Lock()
 	defer is.mux.Unlock()
 	return is.BackendInfo
+}
+
+// GetBackendTipLastAdvance returns the wall-clock time when the backend's
+// Blocks height was last observed to advance. BackendTipLastAdvance is not
+// persisted, so on startup (before the first SetBackendInfo) it is zero; seed
+// it to now on first read so tip-age metrics don't report a bogus huge age.
+func (is *InternalState) GetBackendTipLastAdvance() time.Time {
+	is.mux.Lock()
+	defer is.mux.Unlock()
+	if is.BackendTipLastAdvance.IsZero() {
+		is.BackendTipLastAdvance = time.Now()
+	}
+	return is.BackendTipLastAdvance
 }
 
 // Pack marshals internal state to json

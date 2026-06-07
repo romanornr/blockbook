@@ -21,8 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/linxGnu/grocksdb"
 	"github.com/martinboehm/btcutil/chaincfg"
-	gosocketio "github.com/martinboehm/golang-socketio"
-	"github.com/martinboehm/golang-socketio/transport"
+	"github.com/trezor/blockbook/api"
 	"github.com/trezor/blockbook/bchain"
 	"github.com/trezor/blockbook/bchain/coins/btc"
 	"github.com/trezor/blockbook/common"
@@ -783,6 +782,15 @@ func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 			},
 		},
 		{
+			name:        "apiMultiFiatRates timestamp limit",
+			r:           newGetRequest(ts.URL + "/api/v2/multi-tickers?timestamp=" + strings.Repeat("1,", api.MaxFiatRatesTimestamps) + "1&currency=usd"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body: []string{
+				`{"error":"too many timestamps, max ` + strconv.Itoa(api.MaxFiatRatesTimestamps) + `"}`,
+			},
+		},
+		{
 			name:        "apiAddress v1",
 			r:           newGetRequest(ts.URL + "/api/v1/address/mv9uLThosiEnGRbVPS7Vhyw6VssbVRsiAw"),
 			status:      http.StatusOK,
@@ -806,7 +814,7 @@ func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 			status:      http.StatusOK,
 			contentType: "application/json; charset=utf-8",
 			body: []string{
-				`{"address":"mv9uLThosiEnGRbVPS7Vhyw6VssbVRsiAw","balance":"0","totalReceived":"1234567890123","totalSent":"1234567890123","unconfirmedBalance":"0","unconfirmedTxs":0,"txs":2}`,
+				`{"address":"mv9uLThosiEnGRbVPS7Vhyw6VssbVRsiAw","balance":"0","totalReceived":"1234567890123","totalSent":"1234567890123","unconfirmedTxs":0,"txs":2}`,
 			},
 		},
 		{
@@ -869,7 +877,7 @@ func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 			status:      http.StatusOK,
 			contentType: "application/json; charset=utf-8",
 			body: []string{
-				`{"address":"upub5E1xjDmZ7Hhej6LPpS8duATdKXnRYui7bDYj6ehfFGzWDZtmCmQkZhc3Zb7kgRLtHWd16QFxyP86JKL3ShZEBFX88aciJ3xyocuyhZZ8g6q","balance":"118641975500","totalReceived":"118641975501","totalSent":"1","unconfirmedBalance":"0","unconfirmedTxs":0,"txs":3,"addrTxCount":3,"usedTokens":2}`,
+				`{"address":"upub5E1xjDmZ7Hhej6LPpS8duATdKXnRYui7bDYj6ehfFGzWDZtmCmQkZhc3Zb7kgRLtHWd16QFxyP86JKL3ShZEBFX88aciJ3xyocuyhZZ8g6q","balance":"118641975500","totalReceived":"118641975501","totalSent":"1","unconfirmedTxs":0,"txs":3,"addrTxCount":3,"usedTokens":2}`,
 			},
 		},
 		{
@@ -1083,172 +1091,6 @@ func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 	performHttpTests(tests, t, ts)
 }
 
-func socketioTestsBitcoinType(t *testing.T, ts *httptest.Server) {
-	type socketioReq struct {
-		Method string        `json:"method"`
-		Params []interface{} `json:"params"`
-	}
-
-	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/socket.io/"
-	s, err := gosocketio.Dial(url, transport.GetDefaultWebsocketTransport())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	tests := []struct {
-		name string
-		req  socketioReq
-		want string
-	}{
-		{
-			name: "socketio getInfo",
-			req:  socketioReq{"getInfo", []interface{}{}},
-			want: `{"result":{"blocks":225494,"testnet":true,"network":"fakecoin","subversion":"/Fakecoin:0.0.1/","coin_name":"Fakecoin","about":"blockchain indexer"}}`,
-		},
-		{
-			name: "socketio estimateFee",
-			req:  socketioReq{"estimateFee", []interface{}{17}},
-			want: `{"result":0.000034}`,
-		},
-		{
-			name: "socketio estimateSmartFee",
-			req:  socketioReq{"estimateSmartFee", []interface{}{19, true}},
-			want: `{"result":0.000019}`,
-		},
-		{
-			name: "socketio getAddressTxids",
-			req: socketioReq{"getAddressTxids", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        2000000,
-					"end":          0,
-					"queryMempool": false,
-				},
-			}},
-			want: `{"result":["7c3be24063f268aaa1ed81b64776798f56088757641a34fb156c4f51ed2e9d25","00b2c06055e5e90e9c82bd4181fde310104391a7fa4f289b1704e5d90caa3840"]}`,
-		},
-		{
-			name: "socketio getAddressTxids limited range",
-			req: socketioReq{"getAddressTxids", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        225494,
-					"end":          225494,
-					"queryMempool": false,
-				},
-			}},
-			want: `{"result":["7c3be24063f268aaa1ed81b64776798f56088757641a34fb156c4f51ed2e9d25"]}`,
-		},
-		{
-			name: "socketio getAddressTxids invalid start",
-			req: socketioReq{"getAddressTxids", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        -1,
-					"end":          0,
-					"queryMempool": false,
-				},
-			}},
-			want: `{"error":{"message":"Invalid parameter start"}}`,
-		},
-		{
-			name: "socketio getAddressTxids invalid end",
-			req: socketioReq{"getAddressTxids", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        2000000,
-					"end":          -1,
-					"queryMempool": false,
-				},
-			}},
-			want: `{"error":{"message":"Invalid parameter end"}}`,
-		},
-		{
-			name: "socketio getAddressHistory",
-			req: socketioReq{"getAddressHistory", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        2000000,
-					"end":          0,
-					"queryMempool": false,
-					"from":         0,
-					"to":           5,
-				},
-			}},
-			want: `{"result":{"totalCount":2,"items":[{"addresses":{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz":{"inputIndexes":[1],"outputIndexes":[]}},"satoshis":-12345,"confirmations":1,"tx":{"hex":"","height":225494,"blockTimestamp":1521595678,"version":0,"hash":"7c3be24063f268aaa1ed81b64776798f56088757641a34fb156c4f51ed2e9d25","inputs":[{"txid":"effd9ef509383d536b1c8af5bf434c8efbf521a4f2befd4022bbd68694b4ac75","outputIndex":0,"script":"","sequence":0,"address":"mv9uLThosiEnGRbVPS7Vhyw6VssbVRsiAw","satoshis":1234567890123},{"txid":"00b2c06055e5e90e9c82bd4181fde310104391a7fa4f289b1704e5d90caa3840","outputIndex":1,"script":"","sequence":0,"address":"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz","satoshis":12345}],"inputSatoshis":1234567902468,"outputs":[{"satoshis":317283951061,"script":"76a914ccaaaf374e1b06cb83118453d102587b4273d09588ac","address":"mzB8cYrfRwFRFAGTDzV8LkUQy5BQicxGhX"},{"satoshis":917283951061,"script":"76a9148d802c045445df49613f6a70ddd2e48526f3701f88ac","address":"mtR97eM2HPWVM6c8FGLGcukgaHHQv7THoL"},{"satoshis":0,"script":"6a072020f1686f6a20","address":"OP_RETURN 2020f1686f6a20"}],"outputSatoshis":1234567902122,"feeSatoshis":346}},{"addresses":{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz":{"inputIndexes":[],"outputIndexes":[1,2]}},"satoshis":24690,"confirmations":2,"tx":{"hex":"","height":225493,"blockTimestamp":1521515026,"version":0,"hash":"00b2c06055e5e90e9c82bd4181fde310104391a7fa4f289b1704e5d90caa3840","inputs":[],"outputs":[{"satoshis":100000000,"script":"76a914010d39800f86122416e28f485029acf77507169288ac","address":"mfcWp7DB6NuaZsExybTTXpVgWz559Np4Ti"},{"satoshis":12345,"script":"76a9148bdf0aa3c567aa5975c2e61321b8bebbe7293df688ac","address":"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},{"satoshis":12345,"script":"76a9148bdf0aa3c567aa5975c2e61321b8bebbe7293df688ac","address":"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"}],"outputSatoshis":100024690}}]}}`,
-		},
-		{
-			name: "socketio getAddressHistory invalid from",
-			req: socketioReq{"getAddressHistory", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        2000000,
-					"end":          0,
-					"queryMempool": false,
-					"from":         -1,
-					"to":           5,
-				},
-			}},
-			want: `{"error":{"message":"Invalid parameter from"}}`,
-		},
-		{
-			name: "socketio getAddressHistory invalid to",
-			req: socketioReq{"getAddressHistory", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        2000000,
-					"end":          0,
-					"queryMempool": false,
-					"from":         0,
-					"to":           -1,
-				},
-			}},
-			want: `{"error":{"message":"Invalid parameter to"}}`,
-		},
-		{
-			name: "socketio getAddressHistory invalid start",
-			req: socketioReq{"getAddressHistory", []interface{}{
-				[]string{"mtGXQvBowMkBpnhLckhxhbwYK44Gs9eEtz"},
-				map[string]interface{}{
-					"start":        -1,
-					"end":          0,
-					"queryMempool": false,
-					"from":         0,
-					"to":           5,
-				},
-			}},
-			want: `{"error":{"message":"Invalid parameter start"}}`,
-		},
-		{
-			name: "socketio getBlockHeader",
-			req:  socketioReq{"getBlockHeader", []interface{}{225493}},
-			want: `{"result":{"hash":"0000000076fbbed90fd75b0e18856aa35baa984e9c9d444cf746ad85e94e2997","version":0,"confirmations":0,"height":0,"chainWork":"","nextHash":"","merkleRoot":"","time":0,"medianTime":0,"nonce":0,"bits":"","difficulty":0}}`,
-		},
-		{
-			name: "socketio getDetailedTransaction",
-			req:  socketioReq{"getDetailedTransaction", []interface{}{"3d90d15ed026dc45e19ffb52875ed18fa9e8012ad123d7f7212176e2b0ebdb71"}},
-			want: `{"result":{"hex":"","height":225494,"blockTimestamp":1521595678,"version":0,"hash":"3d90d15ed026dc45e19ffb52875ed18fa9e8012ad123d7f7212176e2b0ebdb71","inputs":[{"txid":"7c3be24063f268aaa1ed81b64776798f56088757641a34fb156c4f51ed2e9d25","outputIndex":0,"script":"","sequence":0,"address":"mzB8cYrfRwFRFAGTDzV8LkUQy5BQicxGhX","satoshis":317283951061},{"txid":"effd9ef509383d536b1c8af5bf434c8efbf521a4f2befd4022bbd68694b4ac75","outputIndex":1,"script":"","sequence":0,"address":"2MzmAKayJmja784jyHvRUW1bXPget1csRRG","satoshis":1}],"inputSatoshis":317283951062,"outputs":[{"satoshis":118641975500,"script":"a91495e9fbe306449c991d314afe3c3567d5bf78efd287","address":"2N6utyMZfPNUb1Bk8oz7p2JqJrXkq83gegu"},{"satoshis":198641975500,"script":"76a9143f8ba3fda3ba7b69f5818086e12223c6dd25e3c888ac","address":"mmJx9Y8ayz9h14yd9fgCW1bUKoEpkBAquP"}],"outputSatoshis":317283951000,"feeSatoshis":62}}`,
-		},
-		{
-			name: "socketio sendTransaction",
-			req:  socketioReq{"sendTransaction", []interface{}{"010000000001019d64f0c72a0d206001decbffaa722eb1044534c"}},
-			want: `{"error":{"message":"Invalid data"}}`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			resp, err := s.Ack("message", tt.req, time.Second*3)
-			if err != nil {
-				t.Errorf("Socketio error %v", err)
-			}
-			if resp != tt.want {
-				t.Errorf("got %v, want %v", resp, tt.want)
-			}
-		})
-	}
-}
 
 type websocketReq struct {
 	ID     string      `json:"id"`
@@ -1877,6 +1719,17 @@ var websocketTestsBitcoinType = []websocketTest{
 		},
 		want: `{"id":"44","data":{"error":{"message":"not supported"}}}`,
 	},
+	{
+		name: "websocket getFiatRatesForTimestamps timestamp limit",
+		req: websocketReq{
+			Method: "getFiatRatesForTimestamps",
+			Params: map[string]interface{}{
+				"currencies": []string{"usd"},
+				"timestamps": make([]int64, api.MaxFiatRatesTimestamps+1),
+			},
+		},
+		want: `{"id":"45","data":{"error":{"message":"too many timestamps, max ` + strconv.Itoa(api.MaxFiatRatesTimestamps) + `"}}}`,
+	},
 }
 
 func runWebsocketTests(t *testing.T, ts *httptest.Server, tests []websocketTest) {
@@ -1958,6 +1811,74 @@ func setupChain(t *testing.T) (bchain.BlockChainParser, bchain.BlockChain) {
 	return parser, chain
 }
 
+func Test_PublicServer_OpenAPIDocs(t *testing.T) {
+	parser, chain := setupChain(t)
+
+	s, dbpath := setupPublicHTTPServer(parser, chain, t, false)
+	defer closeAndDestroyPublicServer(t, s, dbpath)
+	ts := httptest.NewServer(s.https.Handler)
+	defer ts.Close()
+
+	get := func(endpoint string) *http.Response {
+		t.Helper()
+		resp, err := http.DefaultClient.Do(newGetRequest(ts.URL + endpoint))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	resp := get("/api-docs/")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/api-docs/ StatusCode = %v, want %v", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Fatalf("/api-docs/ Content-Type = %q", ct)
+	}
+	csp := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "script-src 'self' https://cdn.jsdelivr.net;") {
+		t.Fatalf("Swagger CSP missing CDN in script-src: %q", csp)
+	}
+	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
+		t.Fatalf("Swagger CSP must not allow unsafe-inline in script-src: %q", csp)
+	}
+	if v := resp.Header.Get("X-Content-Type-Options"); v != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", v)
+	}
+
+	for _, p := range []string{"/api-docs/openapi.yaml", "/openapi.yaml"} {
+		r := get(p)
+		body, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			t.Fatalf("%s StatusCode = %v", p, r.StatusCode)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/yaml; charset=utf-8" {
+			t.Fatalf("%s Content-Type = %q", p, ct)
+		}
+		if !strings.Contains(string(body), "openapi: 3.1.0") {
+			t.Fatalf("%s body missing openapi: 3.1.0", p)
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/openapi.yaml", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /openapi.yaml StatusCode = %v, want %v", r.StatusCode, http.StatusMethodNotAllowed)
+	}
+	if allow := r.Header.Get("Allow"); allow != "GET, HEAD" {
+		t.Fatalf("POST /openapi.yaml Allow = %q, want %q", allow, "GET, HEAD")
+	}
+}
+
 func Test_PublicServer_BitcoinType(t *testing.T) {
 	parser, chain := setupChain(t)
 
@@ -1969,7 +1890,6 @@ func Test_PublicServer_BitcoinType(t *testing.T) {
 	defer ts.Close()
 
 	httpTestsBitcoinType(t, ts)
-	socketioTestsBitcoinType(t, ts)
 	runWebsocketTests(t, ts, websocketTestsBitcoinType)
 }
 
@@ -2578,6 +2498,15 @@ func httpTestsBitcoinTypeExtendedIndex(t *testing.T, ts *httptest.Server) {
 			},
 		},
 		{
+			name:        "apiBlockFilters range too large",
+			r:           newGetRequest(ts.URL + "/api/v2/block-filters?from=0&to=10000"),
+			status:      http.StatusBadRequest,
+			contentType: "application/json; charset=utf-8",
+			body: []string{
+				`{"error":"Requested block filter range too large, max 10000"}`,
+			},
+		},
+		{
 			name:        "apiBlockFilters scriptType=taproot",
 			r:           newGetRequest(ts.URL + "/api/v2/block-filters?lastN=2&scriptType=taproot"),
 			status:      http.StatusBadRequest,
@@ -2780,6 +2709,80 @@ func Test_sanitizePagingParams(t *testing.T) {
 				t.Errorf("sanitizePagingParams(%d, %d, %d, %d) = (%d, %d), want (%d, %d)",
 					tt.page, tt.pageSize, tt.defaultPageSize, tt.maxPageSize,
 					page, pageSize, tt.wantPage, tt.wantPageSize)
+			}
+		})
+	}
+}
+
+func Test_sanitizeAccountPagingParams(t *testing.T) {
+	tests := []struct {
+		name            string
+		page            int
+		pageSize        int
+		defaultPageSize int
+		maxPageSize     int
+		wantPage        int
+		wantPageSize    int
+	}{
+		{"ws getAccountInfo default", 0, 0, txsOnPage, txsInAPI, 0, txsOnPage},
+		{"ws getAccountInfo within limit", 1, 100, txsOnPage, txsInAPI, 1, 100},
+		{"ws getAccountInfo caps page size at txsInAPI", 1, txsInAPI + 1, txsOnPage, txsInAPI, 1, txsInAPI},
+		{"ws getAccountInfo negative defaults", 0, -5, txsOnPage, txsInAPI, 0, txsOnPage},
+		{"api address caps history offset", maxPageNumber, txsInAPI, txsInAPI, txsInAPI, maxAccountHistoryPagingOffset / txsInAPI, txsInAPI},
+		{"explorer address caps history offset", maxPageNumber, txsOnPage, txsOnPage, txsOnPage, maxAccountHistoryPagingOffset / txsOnPage, txsOnPage},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			page, pageSize := sanitizeAccountPagingParams(tt.page, tt.pageSize, tt.defaultPageSize, tt.maxPageSize)
+			if page != tt.wantPage || pageSize != tt.wantPageSize {
+				t.Errorf("sanitizeAccountPagingParams(%d, %d, %d, %d) = (%d, %d), want (%d, %d)",
+					tt.page, tt.pageSize, tt.defaultPageSize, tt.maxPageSize,
+					page, pageSize, tt.wantPage, tt.wantPageSize)
+			}
+		})
+	}
+}
+
+func Test_validateIntValue_gapClamp(t *testing.T) {
+	// Mirrors the WS getAccountInfo gap clamp: validateIntValue(req.Gap, 0, 0, maxGapValue).
+	tests := []struct {
+		name string
+		val  int
+		want int
+	}{
+		{"unset passes through as 0", 0, 0},
+		{"suite default 20 passes through", 20, 20},
+		{"negative defaults to 0", -1, 0},
+		{"caps at maxGapValue", maxGapValue + 1, maxGapValue},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateIntValue(tt.val, 0, 0, maxGapValue)
+			if got != tt.want {
+				t.Errorf("validateIntValue(%d, 0, 0, %d) = %d, want %d",
+					tt.val, maxGapValue, got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_countCommaSeparatedValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		limit int
+		want  int
+	}{
+		{"empty string", "", api.MaxFiatRatesTimestamps, 0},
+		{"single value", "1", api.MaxFiatRatesTimestamps, 1},
+		{"stops after limit exceeded", "1,2,3", 2, 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := countCommaSeparatedValues(tt.value, tt.limit); got != tt.want {
+				t.Errorf("countCommaSeparatedValues(%q, %d) = %d, want %d", tt.value, tt.limit, got, tt.want)
 			}
 		})
 	}

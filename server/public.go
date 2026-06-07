@@ -35,14 +35,18 @@ const blocksOnPage = 50
 const mempoolTxsOnPage = 50
 const txsInAPI = 1000
 const maxWebsocketBlockPageSize = 10000
+const maxBlockFiltersRange = 10000
 const maxPageNumber = 1000000
 const maxGapValue = 10000
 const maxSafePagingOffset = 1000000000
+const maxAccountHistoryPagingOffset = 100000
 const maxSendTxBodyBytes int64 = 8 * 1024 * 1024
 
 const secondaryCoinCookieName = "secondary_coin"
 const totalCoinsCacheTTL = 60 * time.Second
 const templatesDir = "./static/templates"
+const apiDocsIndexFile = "./static/api-docs/index.html"
+const openAPIFile = "./openapi.yaml"
 const (
 	txBitcoinTypeTemplate         = templatesDir + "/tx_bitcointype.html"
 	txEthereumTypeTemplate        = templatesDir + "/tx_ethereumtype.html"
@@ -72,7 +76,6 @@ type PublicServer struct {
 	htmlTemplates[TemplateData]
 	binding             string
 	certFiles           string
-	socketio            *SocketIoServer
 	websocket           *WebsocketServer
 	https               *http.Server
 	db                  *db.RocksDB
@@ -142,11 +145,6 @@ func NewPublicServer(binding string, certFiles string, db *db.RocksDB, chain bch
 		return nil, err
 	}
 
-	socketio, err := NewSocketIoServer(db, chain, mempool, txCache, metrics, is, fiatRates)
-	if err != nil {
-		return nil, err
-	}
-
 	websocket, err := NewWebsocketServer(db, chain, mempool, txCache, metrics, is, fiatRates)
 	if err != nil {
 		return nil, err
@@ -168,7 +166,6 @@ func NewPublicServer(binding string, certFiles string, db *db.RocksDB, chain bch
 		certFiles:           certFiles,
 		https:               https,
 		api:                 api,
-		socketio:            socketio,
 		websocket:           websocket,
 		db:                  db,
 		txCache:             txCache,
@@ -188,8 +185,13 @@ func NewPublicServer(binding string, certFiles string, db *db.RocksDB, chain bch
 	s.templates = s.parseTemplates()
 
 	// map only basic functions, the rest is enabled by method MapFullPublicInterface
-	serveMux.Handle(path+"favicon.ico", http.FileServer(http.Dir("./static/")))
-	serveMux.Handle(path+"static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./static/"))))
+	serveMux.Handle(publicPath(path, "favicon.ico"), prefixedStaticFileServer(publicPath(path, "")))
+	staticPath := publicPath(path, "static") + "/"
+	serveMux.Handle(staticPath, prefixedStaticFileServer(staticPath))
+	apiDocsPath := publicPath(path, "api-docs")
+	serveMux.HandleFunc(apiDocsPath, s.apiDocsHandler(path))
+	serveMux.HandleFunc(apiDocsPath+"/", s.apiDocsHandler(path))
+	serveMux.HandleFunc(publicPath(path, "openapi.yaml"), s.openAPISpecHandler)
 	// default handler
 	serveMux.HandleFunc(path, s.htmlTemplateHandler(s.explorerIndex))
 	// default API handler
@@ -213,8 +215,7 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux := s.https.Handler.(*http.ServeMux)
 	_, path := splitBinding(s.binding)
 	// support for test pages
-	serveMux.Handle(path+"test-socketio.html", http.FileServer(http.Dir("./static/")))
-	serveMux.Handle(path+"test-websocket.html", http.FileServer(http.Dir("./static/")))
+	serveMux.Handle(publicPath(path, "test-websocket.html"), prefixedStaticFileServer(publicPath(path, "")))
 	if s.internalExplorer {
 		// internal explorer handlers
 		serveMux.HandleFunc(path+"tx/", s.htmlTemplateHandler(s.explorerTx))
@@ -288,8 +289,6 @@ func (s *PublicServer) ConnectFullPublicInterface() {
 	serveMux.HandleFunc(path+"api/v2/tickers/", s.jsonHandler(s.apiTickers, apiV2))
 	serveMux.HandleFunc(path+"api/v2/multi-tickers/", s.jsonHandler(s.apiMultiTickers, apiV2))
 	serveMux.HandleFunc(path+"api/v2/tickers-list/", s.jsonHandler(s.apiAvailableVsCurrencies, apiV2))
-	// socket.io interface
-	serveMux.Handle(path+"socket.io/", s.socketio.GetHandler())
 	// websocket interface
 	serveMux.Handle(path+"websocket", s.websocket.GetHandler())
 	s.isFullInterface = true
@@ -306,26 +305,28 @@ func (s *PublicServer) Close() error {
 	return s.https.Close()
 }
 
-// Shutdown shuts down the server
+// Shutdown shuts down the server. http.Server.Shutdown does not drain
+// hijacked WebSocket connections, so after the HTTP listener stops we also
+// drain the WebSocket server's in-flight DB-touching goroutines; otherwise a
+// long getAccountInfo can race rocksdb_close in cgo and SIGSEGV the process.
 func (s *PublicServer) Shutdown(ctx context.Context) error {
 	glog.Infof("public server: shutdown")
-	return s.https.Shutdown(ctx)
+	httpErr := s.https.Shutdown(ctx)
+	wsErr := s.websocket.Shutdown(ctx)
+	if httpErr != nil {
+		return httpErr
+	}
+	return wsErr
 }
 
 // OnNewBlock notifies users subscribed to bitcoind/hashblock about new block
 func (s *PublicServer) OnNewBlock(block *bchain.Block) {
-	s.socketio.OnNewBlockHash(block.Hash)
 	s.websocket.OnNewBlock(block)
 }
 
 // OnNewFiatRatesTicker notifies users subscribed to bitcoind/fiatrates about new ticker
 func (s *PublicServer) OnNewFiatRatesTicker(ticker *common.CurrencyRatesTicker) {
 	s.websocket.OnNewFiatRatesTicker(ticker)
-}
-
-// OnNewTxAddr notifies users subscribed to notification about new tx
-func (s *PublicServer) OnNewTxAddr(tx *bchain.Tx, desc bchain.AddressDescriptor) {
-	s.socketio.OnNewTxAddr(tx.Txid, desc)
 }
 
 // OnNewTx notifies users subscribed to notification about new tx
@@ -343,12 +344,105 @@ func (s *PublicServer) addressRedirect(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ExplorerViews.With(common.Labels{"action": "address-redirect"}).Inc()
 }
 
+func (s *PublicServer) apiDocsHandler(basePath string) http.HandlerFunc {
+	docsPath := publicPath(basePath, "api-docs")
+	specPath := docsPath + "/openapi.yaml"
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case docsPath:
+			if !allowGetOrHead(w, r) {
+				return
+			}
+			http.Redirect(w, r, docsPath+"/", http.StatusMovedPermanently)
+		case docsPath + "/":
+			s.serveAPIDocs(w, r)
+		case specPath:
+			s.openAPISpecHandler(w, r)
+		default:
+			setOpenAPISecurityHeaders(w, "text/plain; charset=utf-8", false)
+			http.NotFound(w, r)
+		}
+	}
+}
+
+func (s *PublicServer) serveAPIDocs(w http.ResponseWriter, r *http.Request) {
+	if !allowGetOrHead(w, r) {
+		return
+	}
+	if s.metrics != nil {
+		s.metrics.ExplorerViews.With(common.Labels{"action": "api-docs"}).Inc()
+	}
+	serveStaticContent(w, r, apiDocsIndexFile, "text/html; charset=utf-8", true)
+}
+
+func (s *PublicServer) openAPISpecHandler(w http.ResponseWriter, r *http.Request) {
+	if !allowGetOrHead(w, r) {
+		return
+	}
+	if s.metrics != nil {
+		s.metrics.ExplorerViews.With(common.Labels{"action": "openapi-spec"}).Inc()
+	}
+	serveStaticContent(w, r, openAPIFile, "application/yaml; charset=utf-8", false)
+}
+
+func serveStaticContent(w http.ResponseWriter, r *http.Request, filename string, contentType string, allowSwaggerAssets bool) {
+	body, err := os.ReadFile(filename)
+	if err != nil {
+		glog.Errorf("serve %s: %v", filename, err)
+		setOpenAPISecurityHeaders(w, "text/plain; charset=utf-8", allowSwaggerAssets)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	setOpenAPISecurityHeaders(w, contentType, allowSwaggerAssets)
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := w.Write(body); err != nil {
+		glog.Warning("write response ", err)
+	}
+}
+
+func allowGetOrHead(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	w.Header().Set("Allow", "GET, HEAD")
+	setOpenAPISecurityHeaders(w, "text/plain; charset=utf-8", false)
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	return false
+}
+
+func setOpenAPISecurityHeaders(w http.ResponseWriter, contentType string, allowSwaggerAssets bool) {
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()")
+	if allowSwaggerAssets {
+		w.Header().Set("Content-Security-Policy", getSwaggerContentSecurityPolicy())
+	} else {
+		w.Header().Set("Content-Security-Policy", getOpenAPISpecContentSecurityPolicy())
+	}
+}
+
+func prefixedStaticFileServer(prefix string) http.Handler {
+	return http.StripPrefix(prefix, http.FileServer(http.Dir("./static/")))
+}
+
 func splitBinding(binding string) (addr string, path string) {
 	i := strings.Index(binding, "/")
 	if i >= 0 {
 		return binding[0:i], binding[i:]
 	}
 	return binding, "/"
+}
+
+func publicPath(basePath string, item string) string {
+	if basePath == "/" {
+		return "/" + item
+	}
+	return strings.TrimRight(basePath, "/") + "/" + item
 }
 
 func joinURL(base string, part string) string {
@@ -964,13 +1058,21 @@ func validateIntParam(value string, defaultValue int, min int, max int) int {
 }
 
 func sanitizePagingParams(page, pageSize, defaultPageSize, maxPageSize int) (int, int) {
+	return sanitizePagingParamsWithMaxOffset(page, pageSize, defaultPageSize, maxPageSize, maxSafePagingOffset)
+}
+
+func sanitizeAccountPagingParams(page, pageSize, defaultPageSize, maxPageSize int) (int, int) {
+	return sanitizePagingParamsWithMaxOffset(page, pageSize, defaultPageSize, maxPageSize, maxAccountHistoryPagingOffset)
+}
+
+func sanitizePagingParamsWithMaxOffset(page, pageSize, defaultPageSize, maxPageSize, maxPagingOffset int) (int, int) {
 	page = validateIntValue(page, 0, 0, maxPageNumber)
 	pageSize = validateIntValue(pageSize, defaultPageSize, 0, maxPageSize)
 	if pageSize == 0 {
 		pageSize = defaultPageSize
 	}
-	if page > 0 && pageSize > 0 && page > maxSafePagingOffset/pageSize {
-		page = maxSafePagingOffset / pageSize
+	if page > 0 && pageSize > 0 && page > maxPagingOffset/pageSize {
+		page = maxPagingOffset / pageSize
 	}
 	return page, pageSize
 }
@@ -979,7 +1081,7 @@ func (s *PublicServer) getAddressQueryParams(r *http.Request, accountDetails api
 	var voutFilter = api.AddressFilterVoutOff
 	page := validateIntParam(r.URL.Query().Get("page"), 0, 0, maxPageNumber)
 	pageSize := validateIntParam(r.URL.Query().Get("pageSize"), maxPageSize, 0, maxPageSize)
-	page, pageSize = sanitizePagingParams(page, pageSize, maxPageSize, maxPageSize)
+	page, pageSize = sanitizeAccountPagingParams(page, pageSize, maxPageSize, maxPageSize)
 	from := validateIntParam(r.URL.Query().Get("from"), 0, 0, 10000000000)
 	to := validateIntParam(r.URL.Query().Get("to"), 0, 0, 10000000000)
 
@@ -1409,7 +1511,7 @@ func (s *PublicServer) apiBlockFilters(r *http.Request, apiVersion int) (interfa
 		BlockFilters map[int]blockFilterResult `json:"blockFilters"`
 	}
 
-	lastN := validateIntParam(r.URL.Query().Get("lastN"), 0, 0, 10000)
+	lastN := validateIntParam(r.URL.Query().Get("lastN"), 0, 0, maxBlockFiltersRange)
 	from := validateIntParam(r.URL.Query().Get("from"), 0, 0, 10000000000)
 	to := validateIntParam(r.URL.Query().Get("to"), 0, 0, 10000000000)
 	scriptType := r.URL.Query().Get("scriptType")
@@ -1445,6 +1547,10 @@ func (s *PublicServer) apiBlockFilters(r *http.Request, apiVersion int) (interfa
 		if to == 0 {
 			to = int(bestHeight)
 		}
+	}
+
+	if to-from+1 > maxBlockFiltersRange {
+		return nil, api.NewAPIError(fmt.Sprintf("Requested block filter range too large, max %d", maxBlockFiltersRange), true)
 	}
 
 	handleBlockFiltersResultFromTo := func(fromHeight int, toHeight int) (interface{}, error) {
@@ -1797,6 +1903,22 @@ func (s *PublicServer) apiTickers(r *http.Request, apiVersion int) (interface{},
 	return result, nil
 }
 
+func countCommaSeparatedValues(s string, limit int) int {
+	if s == "" {
+		return 0
+	}
+	count := 1
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			count++
+			if count > limit {
+				return count
+			}
+		}
+	}
+	return count
+}
+
 // apiMultiTickers returns FiatRates ticker prices for the specified comma separated list of timestamps.
 func (s *PublicServer) apiMultiTickers(r *http.Request, apiVersion int) (interface{}, error) {
 	var result []api.FiatTicker
@@ -1811,6 +1933,9 @@ func (s *PublicServer) apiMultiTickers(r *http.Request, apiVersion int) (interfa
 	if timestampString := r.URL.Query().Get("timestamp"); timestampString != "" {
 		// Get tickers for specified timestamp
 		s.metrics.ExplorerViews.With(common.Labels{"action": "api-multi-tickers-date"}).Inc()
+		if countCommaSeparatedValues(timestampString, api.MaxFiatRatesTimestamps) > api.MaxFiatRatesTimestamps {
+			return nil, api.NewAPIError(fmt.Sprintf("too many timestamps, max %d", api.MaxFiatRatesTimestamps), true)
+		}
 		timestamps := strings.Split(timestampString, ",")
 		t := make([]int64, len(timestamps))
 		for i := range timestamps {

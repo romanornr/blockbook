@@ -21,3 +21,5 @@ __pycache__/
 .dev/
 .spec/
 private_docs/*
+static/api-docs/swagger-ui/
+configs/grafana/grafana.json

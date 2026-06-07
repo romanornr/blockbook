@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -18,6 +19,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/trezor/blockbook/bchain"
 	"github.com/trezor/blockbook/bchain/coins/eth"
+	"github.com/trezor/blockbook/common"
 )
 
 const (
@@ -79,15 +81,22 @@ type tronGetTransactionByIDResponse struct {
 	RawData    struct {
 		Timestamp *int64           `json:"timestamp,omitempty"`
 		FeeLimit  *int64           `json:"fee_limit,omitempty"`
+		Data      string           `json:"data,omitempty"`
 		Contract  []tronTxContract `json:"contract"`
 	} `json:"raw_data"`
 }
 
 type TronRPC struct {
 	*eth.EthereumRPC
-	Parser               *TronParser
-	ChainConfig          *TronConfiguration
-	mq                   *bchain.MQ
+	Parser      *TronParser
+	ChainConfig *TronConfiguration
+	mq          *bchain.MQ
+	// callCtx is the base context for RPC calls (the embedded RPC client and the
+	// HTTP node clients); Shutdown cancels it so an in-flight sync call aborts
+	// promptly. The rpc-client side is also covered by CloseRPC; this additionally
+	// reaches the HTTP node fetches, which CloseRPC cannot.
+	callCtx              context.Context
+	cancelCall           context.CancelFunc
 	fullNodeHTTP         TronHTTP
 	solidityNodeHTTP     TronHTTP
 	internalDataProvider *TronInternalDataProvider
@@ -98,6 +107,10 @@ type TronRPC struct {
 	hasSolidifiedHeight  bool
 	newBlockNotifyCh     chan struct{}
 	newBlockNotifyOnce   sync.Once
+	// lastNotifyNs is the UnixNano of the last ZeroMQ block notification that drove
+	// a tip refresh. tipWatchdog uses it to detect a silently stalled ZeroMQ feed
+	// (Tron has no newHeads WS subscription; if the publisher stops, nothing errors).
+	lastNotifyNs atomic.Int64
 }
 
 func NewTronRPC(config json.RawMessage, pushHandler func(bchain.NotificationType)) (bchain.BlockChain, error) {
@@ -143,7 +156,9 @@ func NewTronRPC(config json.RawMessage, pushHandler func(bchain.NotificationType
 		return nil, errors.Annotate(err, "resolve Tron solidity node HTTP URL")
 	}
 
-	timeout := time.Duration(cfg.RPCTimeout) * time.Second
+	// ethChainConfig.RPCTimeout has already been clamped to a positive value by
+	// NewEthereumRPC, so the HTTP node clients inherit the same finite timeout.
+	timeout := time.Duration(ethChainConfig.RPCTimeout) * time.Second
 	tronRpc.fullNodeHTTP = NewTronHTTPClient(fullNodeURL, timeout)
 	tronRpc.solidityNodeHTTP = NewTronHTTPClient(solidityURL, timeout)
 
@@ -155,7 +170,19 @@ func NewTronRPC(config json.RawMessage, pushHandler func(bchain.NotificationType
 	tronRpc.internalDataProvider = internalProvider
 	tronRpc.EthereumRPC.InternalDataProvider = internalProvider
 
+	tronRpc.callCtx, tronRpc.cancelCall = context.WithCancel(context.Background())
+
 	return tronRpc, nil
+}
+
+// requestContext returns the base context for RPC calls. Shutdown cancels it so
+// in-flight calls abort promptly. Falls back to context.Background() when unset
+// (e.g. a directly-constructed test instance).
+func (b *TronRPC) requestContext() context.Context {
+	if b.callCtx != nil {
+		return b.callCtx
+	}
+	return context.Background()
 }
 
 func resolveTronHTTPURL(explicitURL, rpcURL, defaultPort string) (string, error) {
@@ -218,7 +245,7 @@ func (b *TronRPC) Initialize() error {
 	b.RPC = rc
 	b.MainNetChainID = MainNet
 
-	ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
+	ctx, cancel := context.WithTimeout(b.requestContext(), b.Timeout)
 	defer cancel()
 
 	id, err := b.Client.NetworkID(ctx)
@@ -356,6 +383,22 @@ func (b *TronRPC) getBestHeader() (bchain.EVMHeader, error) {
 	return b.bestHeader, nil
 }
 
+// setBestHeader stores h as the cached tip and reports whether it changed.
+//
+// Unlike EthereumRPC.setBestHeader this is intentionally NON-monotonic: a lower
+// height is accepted. Tron's tip is never taken from the feed header (the ZeroMQ
+// notification carries none) — it is always an HTTP re-query (refreshBestHeaderFromChain),
+// refreshed on every notification and on a tronBestHeaderMaxAge timer, so the cache
+// is meant to track whatever the backend currently reports. Accepting a lower height
+// is what lets a genuine rollback surface immediately to resyncIndex, so Tron is not
+// subject to the frozen-tip masking that the EVM monotonic guard introduces (and which
+// EVM has to undo with a watchdog regress).
+//
+// Tradeoff: with a load-balanced Tron RPC, a single lagging node answering a re-query
+// could regress the tip and trip a spurious fork in resyncIndex (the case the EVM
+// monotonic guard exists to prevent). That is acceptable for the common single-node
+// java-tron backend; if Tron is ever fronted by a load balancer, port the EVM pattern
+// here (monotonic hot path + on-advance liveness + allowRegress watchdog poll).
 func (b *TronRPC) setBestHeader(h bchain.EVMHeader) bool {
 	if h == nil || h.Number() == nil {
 		return false
@@ -403,7 +446,7 @@ func (b *TronRPC) refreshBestHeaderFromChain() (bool, error) {
 	if b.Client == nil {
 		return false, errors.New("rpc client not initialized")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
+	ctx, cancel := context.WithTimeout(b.requestContext(), b.Timeout)
 	defer cancel()
 	h, err := b.Client.HeaderByNumber(ctx, nil)
 	if err != nil {
@@ -431,8 +474,16 @@ func (b *TronRPC) signalNewBlock() {
 	}
 }
 
+func (b *TronRPC) markNotifyAlive() {
+	b.lastNotifyNs.Store(time.Now().UnixNano())
+}
+
 func (b *TronRPC) newBlockNotifier() {
 	for range b.newBlockNotifyCh {
+		// Record that the ZeroMQ feed is delivering (the signal tipWatchdog watches);
+		// watchdog fallback polls deliberately do not touch this, so they cannot mask
+		// a dead feed.
+		b.markNotifyAlive()
 		updated, err := b.refreshBestHeaderFromChain()
 		if err != nil {
 			glog.Error("refreshBestHeaderFromChain ", err)
@@ -445,6 +496,70 @@ func (b *TronRPC) newBlockNotifier() {
 			b.PushHandler(bchain.NotificationNewTx)
 		}
 	}
+}
+
+// tipWatchdog detects a silently stalled ZeroMQ block feed. Unlike the EVM
+// watchdog there is no WS subscription to reconnect (Tron's ZeroMQ SUB
+// auto-reconnects at the transport level), so on a stall it polls the tip
+// directly and, if it advanced, re-triggers sync. This keeps the index moving
+// when the publisher goes quiet instead of waiting for the ~15-minute periodic
+// resync tick. Started exactly once via newBlockNotifyOnce.
+func (b *TronRPC) tipWatchdog() {
+	threshold := b.TipStaleThreshold()
+	interval := threshold / 3
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	if interval > 60*time.Second {
+		interval = 60 * time.Second
+	}
+	glog.Infof("TronRPC: tip watchdog started, stall threshold %s, sampling every %s", threshold, interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if common.IsInShutdown() {
+			return
+		}
+		b.tipWatchdogTick(threshold)
+	}
+}
+
+// tipWatchdogTick is one watchdog evaluation, split out from the ticker loop so
+// it is unit-testable with an injected threshold and a fake client (no wait).
+func (b *TronRPC) tipWatchdogTick(threshold time.Duration) {
+	// Heartbeat: prove the watchdog goroutine is still ticking (see eth tipWatchdogTick).
+	// rate(blockbook_backend_subscription_events{event="watchdog_tick"})==0 means it died.
+	b.ObserveSubscriptionEvent("zeromq", "watchdog_tick")
+	lastNs := b.lastNotifyNs.Load()
+	if lastNs == 0 {
+		return
+	}
+	age := time.Since(time.Unix(0, lastNs))
+	b.SetSubscriptionAgeSeconds(age.Seconds())
+	if age < threshold {
+		return
+	}
+	glog.Warningf("TronRPC: ZeroMQ block feed silent for %s (threshold %s); polling tip", age.Truncate(time.Second), threshold)
+	b.ObserveSubscriptionEvent("zeromq", "watchdog_stall")
+	updated, err := b.refreshBestHeaderFromChain()
+	if err != nil {
+		glog.Error("TronRPC: tip watchdog tip poll error ", err)
+		return
+	}
+	if updated && b.PushHandler != nil {
+		b.ObserveSubscriptionEvent("zeromq", "watchdog_tip_advanced")
+		b.PushHandler(bchain.NotificationNewBlock)
+		b.PushHandler(bchain.NotificationNewTx)
+	}
+	// Deliberately do NOT re-arm liveness here: lastNotifyNs is refreshed only by a
+	// real ZeroMQ delivery (newBlockNotifier), never by the watchdog's own poll —
+	// the same invariant the EVM watchdog keeps. If the poll re-armed it, a feed that
+	// has gone permanently silent while the poll keeps advancing the tip would look
+	// alive and subscription_age_seconds would sawtooth below the threshold instead
+	// of climbing past it, hiding the dead feed from any age-based alert. Polling
+	// every sample interval while the feed stays silent is the intended recovery, not
+	// a problem: Tron blocks are seconds apart, so reaching the threshold already
+	// means an abnormal gap, and the poll keeps sync moving until delivery resumes.
 }
 
 func (b *TronRPC) handleMQNotification(nt bchain.NotificationType) {
@@ -464,19 +579,23 @@ func (b *TronRPC) GetChainParser() bchain.BlockChainParser {
 
 func (b *TronRPC) CreateMempool(chain bchain.BlockChain) (bchain.Mempool, error) {
 	if b.Mempool == nil {
-		b.Mempool = bchain.NewMempoolEthereumType(chain, b.ChainConfig.MempoolTxTimeoutHours, b.ChainConfig.QueryBackendOnMempoolResync)
+		mempoolTxTimeout, err := b.ChainConfig.MempoolTxTimeoutDuration(false)
+		if err != nil {
+			return nil, err
+		}
+		b.Mempool = bchain.NewMempoolEthereumType(chain, mempoolTxTimeout, b.ChainConfig.QueryBackendOnMempoolResync)
 	}
 	return b.Mempool, nil
 }
 
-func (b *TronRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOutpointFunc, onNewTxAddr bchain.OnNewTxAddrFunc, onNewTx bchain.OnNewTxFunc) error {
+func (b *TronRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOutpointFunc, onNewTx bchain.OnNewTxFunc) error {
 	if b.Mempool == nil {
 		return errors.New("Tron Mempool not created")
 	}
-	b.Mempool.OnNewTxAddr = onNewTxAddr
 	b.Mempool.OnNewTx = onNewTx
 	b.newBlockNotifyOnce.Do(func() {
 		go b.newBlockNotifier()
+		go b.tipWatchdog()
 	})
 
 	if b.mq == nil {
@@ -494,10 +613,24 @@ func (b *TronRPC) InitializeMempool(addrDescForOutpoint bchain.AddrDescForOutpoi
 		b.mq = mq
 	}
 
+	// Arm the watchdog's staleness clock once the ZeroMQ feed is established, not on
+	// the first notification that advances the tip. Otherwise a feed that never
+	// advances would leave lastNotifyNs at 0 and the watchdog's (lastNs == 0) gate
+	// disabled (see EthereumRPC.subscribeEvents for the same fix on the EVM path).
+	b.markNotifyAlive()
+
 	return nil
 }
 
 func (b *TronRPC) Shutdown(ctx context.Context) error {
+	// Abort in-flight RPC-client calls (GetBlockHash, raw block fetch, tip re-query)
+	// so a sync call cannot block shutdown up to the RPC timeout. CloseRPC mirrors
+	// EthereumRPC.Shutdown; cancelCall additionally aborts the HTTP node fetches
+	// (tx details) that CloseRPC cannot reach.
+	b.EthereumRPC.CloseRPC()
+	if b.cancelCall != nil {
+		b.cancelCall()
+	}
 	if b.mq != nil {
 		if err := b.mq.Shutdown(ctx); err != nil {
 			return err
@@ -694,7 +827,7 @@ func (b *TronRPC) GetBlock(hash string, height uint32) (*bchain.Block, error) {
 	var internalErr error
 
 	if len(block.Transactions) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
+		ctx, cancel := context.WithTimeout(b.requestContext(), b.Timeout)
 		defer cancel()
 
 		type txInfosResult struct {
@@ -881,6 +1014,9 @@ func (b *TronRPC) getTransactionInfoByIDWithFallback(txid string) (*tronGetTrans
 func (b *TronRPC) GetTransaction(txid string) (*bchain.Tx, error) {
 	txInfo, isSolidified, err := b.getTransactionInfoByIDWithFallback(txid)
 	if err != nil {
+		if isTronTxNotFound(err) {
+			return b.GetTransactionForMempool(txid)
+		}
 		return nil, err
 	}
 	txByID, err := b.getTransactionByID(txid, isSolidified)
@@ -898,6 +1034,29 @@ func (b *TronRPC) GetTransaction(txid string) (*bchain.Tx, error) {
 		b.Mempool.RemoveTransactionFromMempool(strip0xPrefix(txid))
 	}
 	return tx, nil
+}
+
+// GetTransactionForMempool returns a transaction by the transaction ID using
+// the full node HTTP API
+func (b *TronRPC) GetTransactionForMempool(txid string) (*bchain.Tx, error) {
+	ctx, cancel := context.WithTimeout(b.requestContext(), b.Timeout)
+	defer cancel()
+
+	txByID, err := b.requestTransactionFromPending(ctx, txid)
+	if err != nil {
+		if isTronTxNotFound(err) {
+			if b.Mempool != nil {
+				b.Mempool.RemoveTransactionFromMempool(strip0xPrefix(txid))
+			}
+			return nil, bchain.ErrTxNotFound
+		}
+		return nil, err
+	}
+
+	txInfo := &tronGetTransactionInfoByIDResponse{ID: strip0xPrefix(txid)}
+	blockTime, blockNumber, hasBlockNumber := tronTxMeta(txInfo)
+	confirmations := b.computeConfirmationsFromBlockNumber(txid, blockNumber, hasBlockNumber)
+	return b.buildTxFromHTTPData(txByID, txInfo, blockTime, confirmations, nil, false)
 }
 
 // GetTransactionSpecific returns tx-specific JSON in Tron API format (without 0x in tx hash fields).
@@ -928,7 +1087,7 @@ func (b *TronRPC) GetTransactionSpecific(tx *bchain.Tx) (json.RawMessage, error)
 }
 
 func (b *TronRPC) EthereumTypeGetBalance(addrDesc bchain.AddressDescriptor) (*big.Int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
+	ctx, cancel := context.WithTimeout(b.requestContext(), b.Timeout)
 	defer cancel()
 
 	return b.Client.BalanceAt(ctx, addrDesc, nil)
@@ -956,7 +1115,7 @@ func (b *TronRPC) EthereumTypeEstimateGas(params map[string]interface{}) (uint64
 		req["data"] = data
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
+	ctx, cancel := context.WithTimeout(b.requestContext(), b.Timeout)
 	defer cancel()
 
 	var result string
@@ -989,7 +1148,7 @@ func (b *TronRPC) EthereumTypeRpcCall(data, to, from string) (string, error) {
 
 // EthereumTypeGetNonce returns current balance of an address
 func (b *TronRPC) EthereumTypeGetNonce(addrDesc bchain.AddressDescriptor) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), b.Timeout)
+	ctx, cancel := context.WithTimeout(b.requestContext(), b.Timeout)
 	defer cancel()
 	return b.Client.NonceAt(ctx, addrDesc, nil)
 }

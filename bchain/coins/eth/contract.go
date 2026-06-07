@@ -519,7 +519,25 @@ func (b *EthereumRPC) erc20BalancesBatchAtBlock(batcher batchCaller, callData st
 	defer cancel()
 	if err := batcher.BatchCallContext(ctx, batch); err != nil {
 		b.observeEthCallError("batch", "rpc")
-		return nil, err
+		// Distinct fallback metric so monitoring can alert on this path even
+		// though we suppress the error to keep callers (e.g. account info)
+		// usable on transient batch-level RPC failures.
+		b.ObserveChainDataFallback("erc20_batch", "rpc")
+		glog.Warningf("erc20 batch eth_call failed: %v, falling back to single calls", err)
+		balances := make([]*big.Int, len(contractDescs))
+		for i, contractDesc := range contractDescs {
+			data, err := b.EthereumTypeRpcCallAtBlock(callData, hexutil.Encode(contractDesc), "", blockNumber)
+			if err != nil {
+				glog.Warningf("erc20 single eth_call fallback failed for %s: %v", hexutil.Encode(contractDesc), err)
+				continue
+			}
+			balances[i] = parseSimpleNumericProperty(data)
+			if balances[i] == nil {
+				b.observeEthCallError("single", "invalid")
+				glog.Warningf("erc20 single eth_call invalid result for %s: %q", hexutil.Encode(contractDesc), data)
+			}
+		}
+		return balances, nil
 	}
 	balances := make([]*big.Int, len(contractDescs))
 	for i := range batch {
@@ -529,7 +547,7 @@ func (b *EthereumRPC) erc20BalancesBatchAtBlock(batcher batchCaller, callData st
 				continue
 			}
 			glog.Warningf("erc20 batch eth_call failed for %s: %v", hexutil.Encode(contractDescs[i]), batch[i].Error)
-			// In case of batch failure, retry missing/failed elements as single calls.
+			// In case of individual element failure in a successful batch, retry it as a single call.
 			data, err := b.EthereumTypeRpcCallAtBlock(callData, hexutil.Encode(contractDescs[i]), "", blockNumber)
 			if err != nil {
 				glog.Warningf("erc20 single eth_call fallback failed for %s: %v", hexutil.Encode(contractDescs[i]), err)
@@ -542,7 +560,8 @@ func (b *EthereumRPC) erc20BalancesBatchAtBlock(batcher batchCaller, callData st
 			}
 			continue
 		}
-		// Leave nil on parse failures so callers can retry per contract if needed.
+		// Leave nil on parse failures; retrying as a single call is unlikely to help
+		// as malformed returns usually indicate non-conforming contract implementations.
 		balances[i] = parseSimpleNumericProperty(results[i])
 		if balances[i] == nil {
 			b.observeEthCallError("batch", "invalid")
