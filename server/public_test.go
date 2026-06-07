@@ -109,10 +109,10 @@ func setupPublicHTTPServerWithFiatFixture(parser bchain.BlockChainParser, chain 
 		FiatRates:       "coingecko",
 		FiatRatesParams: `{"url": "none", "coin": "ethereum","platformIdentifier": "ethereum","platformVsCurrency": "usd","periodSeconds": 60}`,
 	}
-	return setupPublicHTTPServerWithConfig(parser, chain, t, extendedIndex, config)
+	return setupPublicHTTPServerWithConfig(parser, chain, t, extendedIndex, config, fiatFixture)
 }
 
-func setupPublicHTTPServerWithConfig(parser bchain.BlockChainParser, chain bchain.BlockChain, t *testing.T, extendedIndex bool, config common.Config) (*PublicServer, string) {
+func setupPublicHTTPServerWithConfig(parser bchain.BlockChainParser, chain bchain.BlockChain, t *testing.T, extendedIndex bool, config common.Config, fiatFixture func(*db.RocksDB) error) (*PublicServer, string) {
 	// add block golomb filters with extended index
 	if extendedIndex {
 		config.BlockGolombFilterP = 20
@@ -1090,7 +1090,6 @@ func httpTestsBitcoinType(t *testing.T, ts *httptest.Server) {
 	}
 	performHttpTests(tests, t, ts)
 }
-
 
 type websocketReq struct {
 	ID     string      `json:"id"`
